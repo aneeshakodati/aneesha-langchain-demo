@@ -14,7 +14,18 @@ from langchain.agents.factory import _get_can_jump_to
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 
 from chinook_support import middleware as mw
-from chinook_support.config import GRAPH_RECURSION_LIMIT, MAX_ROUTING_HOPS
+from chinook_support.agents import (
+    build_billing_agent,
+    build_escalation_agent,
+    build_merch_agent,
+)
+from chinook_support.config import (
+    GRAPH_RECURSION_LIMIT,
+    LONGEST_SPECIALIST_CYCLE,
+    MAX_MODEL_CALLS_ESCALATION,
+    MAX_MODEL_CALLS_PER_RUN,
+    MAX_ROUTING_HOPS,
+)
 from chinook_support.graph import run_config
 from chinook_support.middleware import BUDGET_EXCEEDED_REPLY, CallBudgetMiddleware
 from chinook_support.security import AuditLogMiddleware
@@ -149,11 +160,53 @@ def test_every_run_carries_a_recursion_limit():
     assert run_config("t")["configurable"]["thread_id"] == "t"
 
 
-def test_the_ceiling_clears_a_full_hop_budget():
-    """It has to bound a runaway loop without tripping on a legitimate long turn.
+def _cycle_nodes(agent) -> int:
+    """Supersteps one model call costs: every node in the agent's ReAct cycle.
 
-    authenticate + MAX_ROUTING_HOPS x (supervisor + specialist) + a final supervisor
-    + respond is the worst case the hop limit permits.
+    All of them are on the cycle — `__start__` feeds the first `before_model` node
+    and `tools` routes back to it — so the node count is the cycle length.
+    """
+    graph = agent.get_graph()
+    return len([n for n in graph.nodes if n not in ("__start__", "__end__")])
+
+
+#: Each specialist with the call budget its own middleware stack enforces.
+SPECIALISTS = [
+    ("billing", build_billing_agent, MAX_MODEL_CALLS_PER_RUN),
+    ("merch", build_merch_agent, MAX_MODEL_CALLS_PER_RUN),
+    ("escalation", build_escalation_agent, MAX_MODEL_CALLS_ESCALATION),
+]
+
+
+def test_the_ceiling_clears_a_full_hop_budget():
+    """The parent path: the worst case the hop limit permits, and it must fit.
+
+    This assertion is the whole of what the ceiling used to be checked against, and
+    it passed at 15 while escalation needed 51 — see `GRAPH_RECURSION_LIMIT`. It is
+    kept because the parent bound still has to hold, and paired with the two tests
+    below, which check the graphs it was silently not measuring.
     """
     worst_case = 1 + 2 * MAX_ROUTING_HOPS + 1 + 1
-    assert worst_case <= GRAPH_RECURSION_LIMIT < worst_case * 2
+    assert worst_case <= GRAPH_RECURSION_LIMIT
+
+
+def test_the_longest_cycle_matches_the_compiled_agents():
+    """Add a middleware and this fails, rather than 11 eval cases failing."""
+    longest = max(_cycle_nodes(build()) for _, build, _ in SPECIALISTS)
+    assert LONGEST_SPECIALIST_CYCLE == longest
+
+
+@pytest.mark.parametrize("name,build,budget", SPECIALISTS)
+def test_the_ceiling_clears_every_specialist_budget(name, build, budget):
+    """A specialist that spends its entire budget on tool-calling turns.
+
+    `recursion_limit` propagates into subgraphs and cannot be raised from inside
+    one, so this ceiling — not a per-agent value — is what every specialist runs
+    under. The trailing `+ 1` cycle is the trip through `before_model` that finds
+    the budget spent and routes to `__end__`.
+    """
+    worst_case = _cycle_nodes(build()) * (budget + 1)
+    assert worst_case <= GRAPH_RECURSION_LIMIT, (
+        f"{name} can legitimately need {worst_case} supersteps, "
+        f"ceiling is {GRAPH_RECURSION_LIMIT}"
+    )

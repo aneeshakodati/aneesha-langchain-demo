@@ -107,16 +107,38 @@ MAX_MODEL_CALLS_PER_RUN = 8
 MAX_MODEL_CALLS_ESCALATION = 6
 #: Catalog searches per run, so browsing can't grind.
 MAX_CATALOG_SEARCHES_PER_RUN = 6
+#: Nodes in the longest specialist ReAct cycle. Escalation's is the deepest: the
+#: two PII middlewares contribute a `before_model` and an `after_model` node each,
+#: the call budget another of both, plus `model` and `tools`. Every one of them is
+#: a superstep, and the cycle runs once per model call.
+#:
+#: Pinned against the compiled agents by `tests/test_middleware.py` rather than
+#: counted by hand here, because the number changes whenever a middleware is added
+#: and the cost of it being stale is the incident described below.
+LONGEST_SPECIALIST_CYCLE = 8
 #: Supersteps LangGraph will run before raising `GraphRecursionError`.
 #:
-#: The hop limit in `supervisor` already bounds this graph, so under correct
-#: behaviour the ceiling is never reached: authenticate (1) + MAX_ROUTING_HOPS x
-#: (supervisor + specialist) (8) + the supervisor turn that says "finish" (1) +
-#: respond (1) = 11. The point is that it holds when the hop limit *doesn't* --
-#: a reducer that stops resetting `hops`, an edge added back to a specialist. The
-#: default is 25, which is neither derived from this graph nor obviously wrong, so
-#: it would absorb that bug as a slow, expensive turn instead of an error.
+#: One value has to cover every graph in the system, specialists included:
+#: `recursion_limit` propagates down into subgraphs, each subgraph counts its own
+#: supersteps against it, and a subgraph cannot raise it back — `.with_config()` on
+#: a graph attached with `add_node` loses to the config coming down from the parent.
 #:
-#: Set from MAX_ROUTING_HOPS so raising one raises the other; the +4 is headroom for
-#: nodes added around the loop, not for extra trips through it.
-GRAPH_RECURSION_LIMIT = 2 * MAX_ROUTING_HOPS + 7
+#: This used to be `2 * MAX_ROUTING_HOPS + 7`, and the arithmetic behind it was
+#: right about the parent: authenticate (1) + MAX_ROUTING_HOPS x (supervisor +
+#: specialist) (8) + the supervisor turn that says "finish" (1) + respond (1) = 11,
+#: so 15 left headroom. It was measuring the wrong graph. A specialist is a
+#: `create_agent` loop that spends a whole cycle per model call, so escalation's six
+#: calls need ~51 supersteps on their own. Experiment `chinook-full-50137e33` failed
+#: 11 of 35 cases on `GraphRecursionError` in `escalation_agent`: route accuracy
+#: 1.00 -> 0.70, and the escalation judge to 0.00, because the subgraph died before
+#: `file_escalation` ran and the tickets the judge grades were never filed.
+#:
+#: So: longest cycle x largest call budget, plus one cycle for the final trip
+#: through `before_model` that finds the budget spent and exits. That is loose for
+#: the parent graph on purpose. `MAX_ROUTING_HOPS` bounds the routing loop and
+#: `CallBudgetMiddleware` bounds each specialist; this is the backstop for when one
+#: of *those* breaks, which is the job the old comment claimed and the old number
+#: could not do.
+GRAPH_RECURSION_LIMIT = LONGEST_SPECIALIST_CYCLE * (
+    max(MAX_MODEL_CALLS_PER_RUN, MAX_MODEL_CALLS_ESCALATION) + 1
+)
