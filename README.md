@@ -471,6 +471,13 @@ make monitoring   # create the annotation queue + online evaluators (idempotent)
 make reset        # wipe demo state and start over
 ```
 
+The resolution judge runs inside LangSmith rather than in this process, so it
+cannot read `.env`: the workspace needs its own `ANTHROPIC_API_KEY` under
+**Settings → Secrets**. Without it the judge records authentication errors in
+place of scores, which in the UI is easy to mistake for a judge that ran and had
+nothing to say. `make monitoring` checks for the secret and warns if it is
+missing. The PII check is pure Python and needs no key.
+
 ### In Studio
 
 Open the run-config panel and set **context** → `customer_id`. Try:
