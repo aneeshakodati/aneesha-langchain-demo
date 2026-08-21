@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "support": "chinook_support.graph:graph"
+  },
+  "env": ".env"
+}
