@@ -452,4 +452,14 @@ def build_graph(*, checkpointer=None, store=None, host_managed_persistence: bool
 #: Entrypoint for `langgraph.json` / LangGraph Studio. Persistence is injected by
 #: the dev server, so no checkpointer or store here — declared explicitly so this
 #: is a statement about the host rather than an omission.
-graph = build_graph(host_managed_persistence=True)
+#:
+#: `.with_config()` carries the recursion limit because Studio is the one caller
+#: that cannot go through `run_config()`: the server builds the config itself from
+#: the assistant, and every other entrypoint (the demo, the eval harness) gets the
+#: ceiling from `run_config`. Without this, Studio silently ran at LangGraph's
+#: default of 25 — the exact value `GRAPH_RECURSION_LIMIT` exists to override, and
+#: the one host where a runaway loop is being watched by a person who would read
+#: it as the agent thinking hard.
+graph = build_graph(host_managed_persistence=True).with_config(
+    recursion_limit=GRAPH_RECURSION_LIMIT
+)

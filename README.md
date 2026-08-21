@@ -496,6 +496,19 @@ loop, and the tools use `sqlite3`. Local SQLite reads are sub-millisecond so the
 detector is being conservative; a production deployment would use an async driver.
 `make studio` passes the flag for you.
 
+**Why the graph export carries a config.** Studio is the one caller that cannot go
+through `run_config()` — the server builds the run config itself — so the recursion
+ceiling is bound onto the exported graph with `.with_config()`. Without it Studio
+silently ran at LangGraph's default of 25, the exact value `GRAPH_RECURSION_LIMIT`
+exists to override, and a runaway routing loop would have read as the agent
+thinking hard rather than as an error. `tests/test_studio_entrypoint.py` pins it.
+
+**Studio traffic is live traffic.** The dev server traces to `LANGSMITH_PROJECT`,
+which is the same project the run rules from `make monitoring` watch — so anything
+demoed in Studio is scored by the PII check, sampled by the resolution judge, and
+routed to the annotation queue if it files an escalation. Rehearsing in Studio
+populates the monitoring views rather than bypassing them.
+
 ### Resetting between rehearsals
 
 `make reset` rebuilds the demo database from the pristine copy and clears the
@@ -593,4 +606,180 @@ tests/            test_policy.py, test_cart.py, test_scoping.py, test_middleware
 demo.py           scripted 7-act demo
 langgraph.json    Studio entrypoint
 ```
+
+---
+
+## System reference
+
+Everything the system is made of, in one place. This section is generated from the
+code — if it disagrees with the code, the code is right.
+
+### Graph
+
+One parent `StateGraph` (`chinook_support/graph.py`), compiled as `chinook_support`.
+
+```
+START -> authenticate -> supervisor -+-> billing_agent    -+
+                            ^        +-> merch_agent      -+
+                            |        +-> escalation_agent -+
+                            +---------------------------- +
+                                     |
+                                     +-> respond -> END
+```
+
+| Node | Kind | What it does |
+|---|---|---|
+| `authenticate` | plain function | Resolves the caller from **runtime context**, not from the chat. Refuses everything if `customer_id` is absent or unknown. Resets `hops` each turn. |
+| `supervisor` | LLM, structured output | Picks the next specialist or `finish`. Hop-limited; overrides the model when it tries to re-route to the specialist that just answered. |
+| `billing_agent` | `create_agent()` | Orders, charges, refund adjudication. |
+| `merch_agent` | `create_agent()` | Catalog search, constraint-based cart building, checkout. |
+| `escalation_agent` | `create_agent()` | Looks up the assigned rep, files a structured support case. |
+| `respond` | LLM, free text | Replies directly when no specialist will — greetings, out-of-scope, refusals. Guarantees a turn is never silent. |
+
+State (`SupportState`): `messages` (reducer: `add_messages`), plus `route`,
+`route_reason`, `hops`, `authenticated`, `customer_name` — all overwrite-semantics
+and surfaced for tracing/eval.
+
+Context schema (`SupportContext`, Pydantic): `customer_id`, `channel`
+(`web|email|phone|studio`), `staff_agent_email`. Set by the caller; the model has
+no parameter it can emit to change it.
+
+### Models
+
+Four roles, four ids, each read through an accessor so an env override actually
+takes effect (`chinook_support/config.py`).
+
+| Role | Default | Env override | Used by |
+|---|---|---|---|
+| Specialist agents | `anthropic:claude-sonnet-5` | `AGENT_MODEL` | all three `create_agent()` calls |
+| Supervisor router + `respond` | `anthropic:claude-haiku-4-5-20251001` | `ROUTER_MODEL` | `supervisor`, `respond` |
+| Summarization | `anthropic:claude-haiku-4-5-20251001` | `SUMMARY_MODEL` | `SummarizationMiddleware` (merch only) |
+| Offline eval judge | `anthropic:claude-sonnet-5` | `JUDGE_MODEL` | `escalation_summary_quality` |
+| Online eval judge | `anthropic:claude-sonnet-4-5-20250929` | — | LangSmith-hosted `chinook-resolution-quality` |
+
+Router calls go through `_build_router_model()` — `lru_cache`d on
+`(resolved model id, schema)` and wrapped in `.with_retry(stop_after_attempt=3,
+wait_exponential_jitter=True)`.
+
+### Agents and their tools
+
+| Agent | Tools | Notes |
+|---|---|---|
+| `billing_agent` | `list_my_orders`, `get_order_detail`, `check_refund_eligibility`, `issue_refund` | No tool takes a customer id. `issue_refund` re-adjudicates before writing. |
+| `merch_agent` | `search_catalog`, `build_music_cart`, `view_cart`, `add_tracks_to_cart`, `remove_tracks_from_cart`, `checkout_cart` | `build_music_cart` turns natural language into `CartConstraints`; the solver in `cart.py` does the arithmetic. |
+| `escalation_agent` | `get_my_support_rep`, `file_escalation` | `file_escalation` normalizes `category`/`severity`/`sentiment` at the tool boundary rather than rejecting off-vocabulary values. |
+
+Every tool takes `runtime: ToolRuntime` and calls `require_customer_id(runtime.context)`.
+None of them accepts a customer identifier as an argument — that is enforced twice,
+by signature and by `CustomerScopeMiddleware`.
+
+### Middleware stacks
+
+Order matters: `CustomerScopeMiddleware` is first so its pre-check runs before
+anything else and its post-check runs last on the way out.
+
+| Middleware | billing | merch | escalation |
+|---|:--:|:--:|:--:|
+| `CustomerScopeMiddleware` (custom) | ✅ | ✅ | ✅ |
+| `AuditLogMiddleware` (custom) | `area="billing"` | `area="merch"` | `area="escalation"` |
+| `with_customer_profile(...)` — `@dynamic_prompt` | ✅ | ✅ | ✅ |
+| `HumanInTheLoopMiddleware` | `issue_refund`, conditional on `refund_needs_human` | `checkout_cart`, always (gated by `CHECKOUT_ALWAYS_REQUIRES_APPROVAL`) | — |
+| `ToolCallLimitMiddleware` | — | `search_catalog`, run limit 6 | — |
+| `SummarizationMiddleware` | — | trigger 60k tokens, keep 12 messages | — |
+| `PIIMiddleware` | — | — | `email` + `credit_card`, redact on output |
+| `ToolRetryMiddleware` | 2 retries, 0.5s | 2 retries, 0.5s | 2 retries, 0.5s |
+| `ModelRetryMiddleware` (`model_retry()`) | 2 retries, 0.5s, ×2 backoff, continue on failure | same | same |
+| `CallBudgetMiddleware` (custom) | run limit 8 | run limit 8 | run limit 6 |
+
+Custom pieces:
+
+- **`CustomerScopeMiddleware`** — rejects any tool call carrying a customer
+  identifier (`FORBIDDEN_ARGS`), and scans every result for another customer's
+  email. Implements both `wrap_tool_call` and `awrap_tool_call`, because the dev
+  server and Platform run graphs async.
+- **`AuditLogMiddleware`** — append-only record of every tool call with args,
+  status, channel and acting staff. Best-effort: a store failure never fails the
+  customer's request.
+- **`CallBudgetMiddleware`** — `ModelCallLimitMiddleware`, except the customer
+  reads an apology instead of `Model call limits exceeded: run limit (8/8)`. The
+  diagnostic moves to `additional_kwargs` so it's still in the trace.
+- **`model_retry()`** — `ModelRetryMiddleware` rather than a node retry policy, so
+  an exhausted retry can't re-run a tool that already moved money.
+
+### Persistence
+
+| Layer | What lives there | CLI demo | Eval suite | `langgraph dev` / Platform |
+|---|---|---|---|---|
+| Checkpointer (thread-scoped) | conversation, HITL interrupts | `SqliteSaver` → `data/checkpoints.sqlite` | `InMemorySaver` | injected by the host |
+| Store (cross-thread) | cart, audit log, scope violations | `SqliteStore` → `data/store.sqlite` | `InMemoryStore` (fresh per example) | injected by the host |
+| SQLite business data | Chinook + `Refund` + `SupportCase` | `data/chinook_demo.db` | private per-example copy, bound via `_ACTIVE_DB` ContextVar | `data/chinook_demo.db` |
+
+Store namespaces:
+
+| Namespace | Key | Contents |
+|---|---|---|
+| `("cart", <customer_id>)` | `"current"` | `{track_ids, updated_at}` — survives new threads |
+| `("audit", <customer_id>)` | random uuid | one entry per tool call |
+| `("security", <customer_id>)` | random uuid | scope violations |
+
+`build_graph()` is a factory, not a module-level graph, because persistence differs
+by host. Calling it with no checkpointer and without `host_managed_persistence=True`
+emits a `UserWarning` — an interrupt with nowhere to persist doesn't raise, it just
+silently stops pausing.
+
+### Deterministic engines (no LLM)
+
+These are the eval oracle. The model never does the arithmetic.
+
+| Module | Entry point | Returns |
+|---|---|---|
+| `policy.py` | `adjudicate(invoice_id, customer_id)` | `RefundVerdict` — `auto_approve` / `needs_human_approval` / `deny`, plus amount, age, reason code, `requires_escalation` |
+| `cart.py` | `build_cart(constraints, customer_id)` | `CartPlan` — items, total, distinct artists, genre breakdown, `unmet_constraints` |
+
+### Policy thresholds
+
+All in `config.py`, all compared in Python rather than read out of a prompt.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `REFUND_WINDOW_DAYS` | 30 | older than this → never auto-refundable |
+| `REFUND_AUTO_APPROVE_LIMIT` | $10.00 | at or below → no human needed |
+| `REFUND_HARD_CEILING` | $100.00 | above → refused outright, approved or not |
+| `MAX_CART_ITEMS` | 40 | |
+| `CHECKOUT_ALWAYS_REQUIRES_APPROVAL` | `True` | the only thing between the agent and a real order |
+| `MAX_ROUTING_HOPS` | 4 | supervisor↔specialist round trips per turn |
+| `MAX_MODEL_CALLS_PER_RUN` | 8 | billing, merch |
+| `MAX_MODEL_CALLS_ESCALATION` | 6 | tighter — it's a fixed routine |
+| `MAX_CATALOG_SEARCHES_PER_RUN` | 6 | |
+| `GRAPH_RECURSION_LIMIT` | `2 × MAX_ROUTING_HOPS + 7` = 15 | backstop for when the hop limit itself breaks |
+
+### Evaluation
+
+**Offline** — dataset `chinook-support-agent` (`evals/dataset.py`), built from seven
+case families: refund, billing lookup, cart, catalog, escalation, adversarial,
+conversational. Each example is `{inputs: {message, customer_id}, outputs:
+{expected_area, ...}, metadata: {kind, name, area}}`.
+
+| Evaluator (`evals/evaluators.py`) | Type | Measures |
+|---|---|---|
+| `no_data_leakage` | code | no other customer's name or email in the reply |
+| `policy_adherence` | code | the reply matches `adjudicate()`'s verdict |
+| `cart_constraints_satisfied` | code | the cart in the store actually meets the constraints |
+| `route_accuracy` | code | supervisor picked the expected area |
+| `escalation_summary_quality` | LLM judge | handoff quality against verified account facts |
+
+All five are wrapped in `scoped(...)`, which binds the evaluator to the example's
+private database copy.
+
+**Online** — provisioned in code by `evals/langsmith_setup.py` against project
+`chinook-support`:
+
+| Artifact | Type | Purpose |
+|---|---|---|
+| `chinook-pii-in-reply` | code evaluator | flags emails / card numbers in the customer-facing reply |
+| `chinook-resolution-quality` | LLM judge (Sonnet 4.5, prompt hub handle `chinook-resolution-quality`) | did the turn actually resolve the request |
+| `chinook-escalation-review` | annotation queue | escalations routed to a human reviewer |
+
+Three run rules wire them up: `escalations -> human review`, `online: pii in reply`,
+`online: resolution quality`.
 
