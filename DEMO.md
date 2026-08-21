@@ -185,7 +185,10 @@ handoff, refusal. That is the whole argument.
 
 ## Part 3 — The cognitive architecture
 
-*Eight minutes. The Studio graph view is the visual aid.*
+*Eight minutes live; the Studio graph view is the visual aid. This part is longer on
+the page than in the room — the four design decisions and the two "at a glance"
+tables are the talk track, and the per-agent and per-middleware write-ups below them
+are there for the questions afterwards and for whoever inherits this repo.*
 
 ```
         ┌──────────────┐
@@ -219,6 +222,7 @@ all 12. Tool confusion is the most common way agents fail in production — not
 hallucination, just calling the wrong function. And *policy differs by area*:
 billing needs human approval, merch needs a search budget and summarization,
 escalation needs PII redaction. A flat agent pays for all of it on every request.
+(Detail on each agent and each middleware is below.)
 
 **3. A deterministic router.** The supervisor emits structured output
 (`RouteDecision`: `billing | merch | escalation | finish`, plus a `reason` and a
@@ -244,35 +248,352 @@ The prompts deliberately contain **no policy numbers**. If `BILLING_PROMPT` said
 "refunds under $10", there would be two sources of truth and they would drift. A
 number in a prompt is a suggestion; a number Python compares against is a rule.
 
-### The tools
+### The cast — six nodes, three of which are agents
 
-| Agent | Tools | Notes |
+Only three nodes are `create_agent()` agents with a model, tools and a loop. The
+other three are cheap, narrow, and deliberately *not* agents — a distinction worth
+making out loud, because "make it an agent" is the reflex that turns a $0.002 turn
+into a $0.05 one.
+
+| Node | Kind | Exists because |
 |---|---|---|
-| `billing_agent` | `list_my_orders`, `get_order_detail`, `check_refund_eligibility`, `issue_refund` | `issue_refund` re-adjudicates before writing. `order_id` is the one attacker-controlled parameter, so every tool taking one re-checks ownership. |
-| `merch_agent` | `search_catalog`, `build_music_cart`, `view_cart`, `add_tracks_to_cart`, `remove_tracks_from_cart`, `checkout_cart` | `build_music_cart` turns natural language into constraints; `cart.py` does the arithmetic. |
-| `escalation_agent` | `get_my_support_rep`, `file_escalation` | `file_escalation` normalizes `category`/`severity`/`sentiment` at the tool boundary instead of rejecting off-vocabulary values. |
+| `authenticate` | plain Python function, no LLM | Identity must be established before anything else runs, and it must come from the session rather than the chat. There is no judgement call here, so there is no model. |
+| `supervisor` | one structured-output call, cheap model | Something has to pick the specialist, and the choice needs to be *legible and measurable*, not buried inside a handoff tool. |
+| `respond` | one free-text call, cheap model, **no tools** | A turn must never end in silence. |
+| `billing_agent` | `create_agent()` | ↓ |
+| `merch_agent` | `create_agent()` | ↓ |
+| `escalation_agent` | `create_agent()` | ↓ |
+
+#### `billing_agent` — the one that moves money
+
+**What it does.** Order history, order detail, refund adjudication, refund
+execution. Tools: `list_my_orders`, `get_order_detail`, `check_refund_eligibility`,
+`issue_refund`.
+
+**Why it exists as its own agent.** It is the only specialist whose actions are
+*irreversible and financial*, so it is the only one that needs human approval
+wiring — and it needs that approval to be conditional, because paging a
+representative for a $4 refund is how you get the approval step switched off within
+a month. Splitting it out is what lets the approval gate be conditional here and
+absent everywhere else.
+
+**The one thing to understand about it.** Its prompt contains no policy numbers. It
+is told to call `check_refund_eligibility` — always — and to act on whatever comes
+back, with an explicit instruction not to state any threshold that didn't come from
+the tool. The agent's job is conversation and sequencing; the *decision* belongs to
+`policy.adjudicate()`. That single choice is what makes `policy_adherence` a
+deterministic evaluator rather than a judge.
+
+**Its sharpest edge.** `order_id` is the one identifier a customer legitimately
+knows and types, which makes it attacker-controlled — so every tool that accepts one
+re-checks ownership, and returns the *same* "not found on this account" message
+whether the order doesn't exist or belongs to somebody else. Distinguishing the two
+would leak the existence of other customers' order ids. And `issue_refund`
+re-adjudicates at execution time rather than trusting that the eligibility tool ran
+first: a human approving the interrupt approves *this* refund, not an earlier quote.
+
+#### `merch_agent` — the one that must not do arithmetic
+
+**What it does.** Catalog search, constraint-based cart building, cart edits,
+checkout. Tools: `search_catalog`, `build_music_cart`, `view_cart`,
+`add_tracks_to_cart`, `remove_tracks_from_cart`, `checkout_cart`.
+
+**Why it exists as its own agent.** It is the only open-ended, long-running flow.
+Browsing is where a conversation grows to twenty messages and six searches, so it is
+the only place that needs a search budget and conversation summarization — and both
+of those cost something on every request, which is exactly why you don't want them
+on a one-line refund question.
+
+**The one thing to understand about it.** The division of labour inside
+`build_music_cart`. The model's entire contribution is parsing *"some jazz and blues,
+under fifteen bucks, nothing I've already got"* into a `CartConstraints` object.
+`cart.py` — pure Python, deterministic, no LLM — solves it over 3,503 tracks and
+returns the exact total. The prompt forbids the agent from adding up prices itself
+and forbids it from calling the tool repeatedly to narrow in: one call solves every
+constraint at once.
+
+**Its sharpest edge.** `unmet_constraints`. The solver reports what it *couldn't*
+do, and the prompt requires the agent to lead with that before describing what it
+did. A solver that quietly returns a 3-track cart when you asked for 30 and implies
+success is the failure this agent is designed around — and
+`cart_constraints_satisfied` fails the example if the shortfall isn't admitted.
+
+#### `escalation_agent` — the one writing for a human, not the customer
+
+**What it does.** Looks up the customer's assigned representative from Chinook's own
+org chart, then files a structured support case. Tools: `get_my_support_rep`,
+`file_escalation`. Two tools, the smallest surface of the three.
+
+**Why it exists as its own agent.** Its *audience* is different. The other two talk
+to the customer; this one produces an artifact that leaves the system and is read by
+someone who has not seen the conversation and never will. Different audience,
+different failure mode, different controls — it is the only agent with PII
+redaction, and it gets a tighter call budget because it runs a fixed routine rather
+than an open-ended conversation.
+
+**The one thing to understand about it.** `file_escalation`'s signature *is* the
+ticket schema — category, severity, sentiment, subject, summary, steps taken,
+recommendation, related orders. The agent structurally cannot file a case without
+separately stating what the customer wants, what was already tried, and what it
+recommends. A vague ticket wastes the rep's time and makes the customer repeat
+themselves, which is the most common complaint about support anywhere.
+
+**Its sharpest edge.** It is reached only when the conversation already needs a
+human, so **there is no version of this turn that ends without a ticket.** File
+first, ask second. If the issue is unknown, it files one saying so. This is a
+correction: it used to say "I'll get this straight to a person — what's it about?"
+and file nothing, which is worse than refusing outright.
+
+**Why it sees the whole conversation.** The specialists share `messages`, so
+escalation inherits everything billing already tried — the order age, the amount,
+the policy verdict. That is the single strongest argument for a real `StateGraph`
+over subagents-as-tools, which would hand this agent a one-line task description and
+produce a ticket that says "please look up order #416".
+
+#### One rule that spans all three
 
 **No tool accepts a customer identifier.** `list_my_orders(limit)`, never
-`list_orders(customer_id)`. `tests/test_scoping.py` asserts that over every tool, so
-it stays true as tools are added.
+`list_orders(customer_id)`. Identity is read inside the tool from
+`runtime.context.customer_id`. `tests/test_scoping.py` asserts this over every tool,
+so it stays true as tools are added.
 
-### Middleware — where the per-area policy actually lives
+---
 
-| Middleware | billing | merch | escalation | Why |
-|---|:--:|:--:|:--:|---|
-| `CustomerScopeMiddleware` (custom) | ✅ | ✅ | ✅ | Rejects any call carrying a customer identifier; scans results for another customer's email. Implements **both** `wrap_tool_call` and `awrap_tool_call`. |
-| `AuditLogMiddleware` (custom) | ✅ | ✅ | ✅ | "The agent did it" is not an answer to "why does this order exist?" |
-| `@dynamic_prompt` | ✅ | ✅ | ✅ | Injects the authenticated name/location/rep at request time, so the prompt is structurally incapable of being about the wrong person. |
-| `HumanInTheLoopMiddleware` | `issue_refund`, conditional | `checkout_cart`, always | — | The `when` predicate runs the real policy engine. |
-| `ToolCallLimitMiddleware` | — | `search_catalog` ×6 | — | Browsing is the one flow that genuinely runs away. |
-| `SummarizationMiddleware` | — | ✅ | — | Long browse sessions are the only place context gets tight. |
-| `PIIMiddleware` | — | — | email + credit card, redact | A ticket leaves the system. The prompt already says not to include contact details — but a prompt is not a control. |
-| `ToolRetryMiddleware` | ✅ | ✅ | ✅ | Transient DB faults. |
-| `ModelRetryMiddleware` | ✅ | ✅ | ✅ | The other half. A 429 between two tools used to end the turn. Retrying the *model call*, not the node — a node retry would re-run `file_escalation` and file a second ticket. |
-| `CallBudgetMiddleware` (custom) | 8 | 8 | 6 | Cost ceiling — with the diagnostic moved off the customer-facing message. |
+### Why middleware at all
 
-That table *is* the argument for splitting into specialists. Those are real
-differences, not settings that could be merged.
+The agent loop is a fixed cycle: call the model, run the tools it asked for, call
+the model again, stop when it stops asking. Left alone that loop is a black box with
+exactly two seams you can reach — you can edit the prompt, or you can edit every
+tool. Both are bad places to put the things that actually keep an agent shippable.
+
+Middleware is the supported third seam: hooks that run at defined points in the
+loop. `before_model` / `after_model` can inspect state and even end the run;
+`wrap_model_call` (and `@dynamic_prompt`) shape the request going out;
+`wrap_tool_call` / `awrap_tool_call` intercept every tool call before and after it
+executes.
+
+Four reasons it earns its place here, in order of importance:
+
+1. **A prompt is an instruction; middleware is a control.** The escalation prompt
+   already says "do not include the customer's email address." The model honours
+   that most of the time — and nobody can tell you what "most" is. `PIIMiddleware`
+   makes it not matter. Every control in this repo that carries real consequence is
+   written twice: once as a prompt so the model cooperates, and once as code so it
+   doesn't matter when it doesn't.
+2. **Cross-cutting concerns have nowhere else to live.** Audit logging, tenant
+   scoping and retries apply to all twelve tools. Implemented inside the tools that
+   is twelve copies and one that somebody forgets; expressed in the prompt it isn't
+   enforced at all. One middleware, applied to the stack, covers every tool
+   including the ones added next year.
+3. **It's what makes "policy differs by area" expressible.** Billing needs approval,
+   merch needs a search budget and summarization, escalation needs redaction. Those
+   aren't settings that could be merged — and middleware is the mechanism that lets
+   three agents share one loop implementation while carrying genuinely different
+   policy. Without it, "specialists" would be a cosmetic split.
+4. **It's independently testable.** `tests/test_middleware.py` and
+   `tests/test_scoping.py` call the hooks directly — sync and async, with hostile
+   inputs — without running an agent or spending a token. A security control you can
+   unit-test in four milliseconds is one you will actually keep testing.
+
+### The middleware, one at a time
+
+At a glance — and note the **order matters**. `CustomerScopeMiddleware` is first so
+its pre-check runs before anything else touches the call and its post-check runs
+last on the way back out.
+
+| Middleware | billing | merch | escalation |
+|---|:--:|:--:|:--:|
+| `CustomerScopeMiddleware` (custom) | ✅ | ✅ | ✅ |
+| `AuditLogMiddleware` (custom) | `area="billing"` | `area="merch"` | `area="escalation"` |
+| `with_customer_profile(...)` — `@dynamic_prompt` | ✅ | ✅ | ✅ |
+| `HumanInTheLoopMiddleware` | `issue_refund`, conditional | `checkout_cart`, always | — |
+| `ToolCallLimitMiddleware` | — | `search_catalog` ×6 | — |
+| `SummarizationMiddleware` | — | 60k tokens, keep 12 | — |
+| `PIIMiddleware` | — | — | email + card, redact |
+| `ToolRetryMiddleware` | ✅ | ✅ | ✅ |
+| `ModelRetryMiddleware` | ✅ | ✅ | ✅ |
+| `CallBudgetMiddleware` (custom) | 8 calls | 8 calls | 6 calls |
+
+**`CustomerScopeMiddleware`** *(custom — all three agents)*
+**Does:** two checks around every tool call. *Before:* rejects any call whose
+arguments contain a customer identifier at all — `customer_id`, `cust_id`,
+`account_id`, `user_id`, `on_behalf_of`, and friends. *After:* scans the flattened
+result for any customer email that doesn't belong to the caller. Either check
+returns a `ToolMessage` with `status="error"` carrying an instruction the model can
+act on, and records the violation to the store under `("security", customer_id)`.
+**Why:** the primary control — identity in runtime context — is sound, but it depends
+on every tool being written correctly *forever*. This is the backstop for the day
+someone adds `get_invoices(customer_id: int)` because it was convenient. It is
+deliberately narrow: emails, not names, because Chinook has an artist called "King"
+and a customer called King, and a tripwire that cries wolf gets removed. It is proof
+the control held, not a sanitizer that makes an unsafe tool safe.
+**The lesson attached to it:** it originally implemented only `wrap_tool_call`. Every
+local test passed. Studio raised `NotImplementedError`, because it invokes graphs
+asynchronously — so the security control was absent in the one environment that
+mattered. Both hooks now exist and both are tested.
+
+**`AuditLogMiddleware(area=...)`** *(custom — all three agents)*
+**Does:** wraps every tool call and appends one record to the store under
+`("audit", customer_id)`: area, tool name, truncated arguments, outcome
+(`ok` / `error` / `exception:Type`), channel, the acting staff email if a rep is
+driving, and a timestamp. Best-effort — a store failure is swallowed rather than
+failing the customer's request.
+**Why:** the write paths create facts and obligations. "The agent did it" is not an
+acceptable answer to "why does this order exist?" or "who authorised this refund?"
+Escalation is audited on the same terms as the two money-moving paths, because
+`file_escalation` creates an obligation a human downstream has to honour. The
+`staff_agent_email` field is the subtle part: a rep driving on a customer's behalf is
+*allowed*, and logged, so impersonation is attributable rather than blocked.
+
+**`with_customer_profile(...)` — a `@dynamic_prompt` middleware** *(all three)*
+**Does:** at request time, appends the authenticated customer's name, account number,
+location, assigned rep and channel to the specialist's base prompt. If the caller is
+unauthenticated it appends the opposite instruction instead: use no tool, tell them
+to sign in.
+**Why:** a static prompt with a name baked into it can be about the wrong person. This
+one is rendered from the *same runtime context the tools are scoped by*, so the
+prompt and the data access are structurally incapable of disagreeing. It is also
+what produces the nice demo moment in turn 3 — the agent greets Luís by name and
+nobody typed the name into the chat.
+
+**`HumanInTheLoopMiddleware`** *(billing: `issue_refund`, conditional — merch:
+`checkout_cart`, always)*
+**Does:** pauses the graph *before* a named tool executes and surfaces an interrupt.
+The pending decision is persisted by the checkpointer, so the run can sit there
+across a restart and be resumed later with
+`Command(resume={"decisions": [{"type": "approve"}]})` — or `reject` with feedback
+the agent then relays.
+**Why:** some actions cannot be undone by apologising. Two configuration details do
+most of the work here. `when` receives the real `ToolCallRequest`, so the gate runs
+the *actual policy engine against the actual arguments* — a $4 refund goes straight
+through, a $25.74 one stops — which means the decision to involve a human is never
+the model's to make. And `description` is a factory that renders amount, order age
+and the customer's stated reason, so a reviewer decides on facts instead of
+rubber-stamping a raw JSON tool call they'd have to go look up. Reads are listed
+explicitly as `False` rather than left to the default, so the decision not to gate
+them is written down.
+
+**`ToolCallLimitMiddleware`** *(merch only — `search_catalog`, 6 per run)*
+**Does:** caps how many times one *named* tool may run in a single turn.
+`exit_behavior="continue"` means the agent keeps working without that tool rather
+than dying.
+**Why:** browsing is the one flow that genuinely runs away — each search returns rows
+and the model always wants one more. The cap is scoped to the tool rather than the
+agent because the pathology belongs to the tool, and the prompt reinforces it
+("spend them on distinct questions; widen a search that returned nothing rather than
+repeating it").
+
+**`SummarizationMiddleware`** *(merch only — trigger 60k tokens, keep 12 messages)*
+**Does:** once the thread crosses the token trigger, compresses the older messages
+with a cheap model and keeps the most recent twelve intact.
+**Why:** long browse sessions are the only place in this system where context actually
+gets tight. It's on merch and nowhere else for a reason that is the whole
+per-area argument in miniature: summarization costs a check on every request, and a
+one-line refund question should not pay for a problem it will never have.
+
+**`PIIMiddleware`** *(escalation only — `email` and `credit_card`, redact on output)*
+**Does:** detects and redacts email addresses and card numbers in the agent's output.
+**Why:** this is the cleanest single illustration of why middleware exists. A support
+case *leaves the system* — a human reads it, and a real deployment exports it to a
+ticketing tool. The escalation prompt already instructs the model not to include
+contact details. That instruction is followed most of the time. "Most of the time"
+is not a control, so the guarantee is implemented in code as well.
+
+**`ToolRetryMiddleware`** *(all three — 2 retries, 0.5s)*
+**Does:** retries a tool call that raised.
+**Why:** transient database faults. Cheap insurance, and the least interesting
+middleware here — which is the point of naming it separately from the next one.
+
+**`ModelRetryMiddleware`**, via `model_retry()` *(all three — 2 retries, 0.5s, ×2
+backoff, `on_failure="continue"`)*
+**Does:** retries the *model* call.
+**Why:** because only half of each specialist was covered. `ToolRetryMiddleware`
+caught a flaky SQLite read, while a 429 or a dropped connection on the model call
+went straight up and ended the turn — and a specialist makes more model calls than
+tool calls, so the uncovered half was the likelier one to fail. Two things about
+*where* it sits are load-bearing: a node-level retry (`add_node(retry_policy=...)`)
+would re-run the specialist from its first message, so a failure after
+`file_escalation` returned would file a second ticket; and `.with_retry()` on the
+model wraps it in a `RunnableRetry`, which has no `bind_tools`, so `create_agent`
+rejects it — a mistake that looks correct and fails only once an agent tries to call
+a tool.
+
+**`CallBudgetMiddleware`** *(custom subclass of `ModelCallLimitMiddleware` — billing 8,
+merch 8, escalation 6)*
+**Does:** a hard ceiling on model calls per run; when it trips, the run ends. The
+subclass substitutes customer-facing text for the stock diagnostic and moves the
+diagnostic into `additional_kwargs`, where it is still visible in the trace.
+**Why:** runaway-loop and cost protection — and the substitution is not cosmetic. The
+stock middleware ends a run by injecting `Model call limits exceeded: run limit
+(4/4)` as an assistant message, and because that is a perfectly good message with
+content in it, every downstream "did anyone answer?" check is satisfied by it and it
+sails through as the final reply. The eval suite caught exactly that, in a run that
+had *already filed the support case* and died before it could say so. That is also
+why escalation's ceiling is 6 rather than 4: the original left no room for a single
+tool retry. The replacement text is deliberately non-committal about what got done —
+when the ceiling trips, some work may have landed and some may not, and a support
+bot guessing about whether it refunded you is its own incident.
+
+That per-column difference in the table above *is* the argument for splitting into
+specialists. A flat agent would carry the union of all of it on every request: the
+summarization check on a one-line refund question, the approval machinery while
+somebody browses jazz.
+
+### Where the context is actually set
+
+`SupportContext` is the security boundary, so "who sets it, and where" is the first
+question a security review asks. There are exactly two halves to the answer:
+**declared once in the code, supplied per-run by the caller.**
+
+**Declared** in two places, and both matter:
+
+```python
+# graph.py — the parent graph
+StateGraph(SupportState, context_schema=SupportContext)
+
+# agents.py — and on each specialist, which is what makes
+# `runtime.context` typed inside the tools
+create_agent(model=..., tools=..., middleware=..., context_schema=SupportContext)
+```
+
+**Supplied** per run, by whoever is calling the graph. Four callers, four places:
+
+| Caller | Where you set it | How |
+|---|---|---|
+| **LangGraph Studio** (`make studio`) | The run-config panel, under **context** → `customer_id` | Studio renders the Pydantic schema as a form — that's why `SupportContext` is a `BaseModel` and not a dataclass. The server sends it as JSON. |
+| **`demo.py`** | `Session.__init__`, `demo.py:84` | `SupportContext(customer_id=1, channel="web")`, then passed to `graph.invoke(..., context=self.context)` at `demo.py:94` |
+| **Eval harness** | `run_eval._run_one`, `evals/run_eval.py:134` | Same object, into `graph.stream(..., context=context)` — the harness plays the application's role, one context per example |
+| **Deployed** (LangGraph Platform / server) | The run request | `client.runs.create(thread_id, assistant_id, input=..., context={"customer_id": 1})` — `context` is a first-class parameter on the SDK's runs client |
+
+In every case it is the **caller's** job, never the model's. Nothing the customer
+types reaches it.
+
+**Reading it back** — three call sites, three accessors, and none of them is a tool
+parameter:
+
+```python
+# in a tool          — raises PermissionError rather than querying customer_id = None
+customer_id = require_customer_id(runtime.context)
+
+# in middleware      — request.runtime, and it may be absent outside a graph
+context = coerce_context(getattr(request.runtime, "context", None))
+
+# in a graph node    — authenticate() is the only place identity is established
+context = coerce_context(runtime.context)
+```
+
+Both helpers normalize defensively because LangGraph hands the context through as
+either the typed object or a plain dict depending on how the run started — Studio
+sends JSON. `require_customer_id` *raises* on a missing id rather than returning
+`None`, so an unauthenticated request fails loudly at the boundary instead of
+quietly running a query scoped to nobody.
+
+**The demo caveat, say it out loud.** In Studio *you* are playing the role of the
+application, which is why `customer_id` is an editable form field — and switching it
+mid-demo is the fastest way to show tenant isolation. In a real deployment it is
+never editable by the end user: it comes off the authenticated session server-side,
+and `channel` and `staff_agent_email` are set the same way. Making it a form field
+is a demo affordance, not the design.
 
 ### Five layers of tenant isolation
 
