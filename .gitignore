@@ -1,0 +1,29 @@
+# Secrets — never commit these. .env holds a live ANTHROPIC_API_KEY.
+.env
+.env.*
+!.env.example
+**/.env
+
+# Local agent tooling — skill packs and settings, not part of this project.
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Generated data. `python scripts/build_db.py` rebuilds all of it from the
+# upstream Chinook dump, so there's no reason to carry ~2MB of binaries in git.
+data/Chinook_Sqlite.sql
+data/*.db
+data/*.sqlite
+
+# LangGraph dev server scratch
+.langgraph_api/
+
+# OS
+.DS_Store

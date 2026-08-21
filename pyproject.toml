@@ -1,0 +1,44 @@
+[project]
+name = "chinook-support"
+version = "0.1.0"
+description = "Chinook Records customer support agent — LangChain + LangGraph + LangSmith proof of concept"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.3,<2",
+    # Declared explicitly even though `langchain` pulls it in: this package
+    # imports from `langchain_core` directly (messages, prompts, tracers), which
+    # makes it a first-order dependency, and a transitive pin is not a contract.
+    "langchain-core>=1.6,<2",
+    "langgraph>=1.2,<2",
+    "langchain-anthropic>=1.6",
+    "langgraph-checkpoint-sqlite>=3.0",
+    "langsmith>=0.11",
+    "python-dotenv>=1.0",
+    "pydantic>=2.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "langgraph-cli[inmem]>=0.4",
+    "pytest>=8.0",
+    # `tests/test_middleware.py` covers the async middleware path — the one that
+    # only runs under the dev server, and the one bug 1 in the README hid in. It
+    # was passing locally on an undeclared transitive install; a clean `make setup`
+    # would have skipped or errored on exactly the test that matters most.
+    "pytest-asyncio>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["chinook_support*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Pydantic serializer warnings:UserWarning"]
+# Strict: async tests must carry `@pytest.mark.asyncio`. The alternative (`auto`)
+# silently adopts every coroutine, which hides a missing marker — and a missing
+# marker on the async middleware test is how a security hook goes untested.
+asyncio_mode = "strict"
