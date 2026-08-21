@@ -152,7 +152,7 @@ def _host(client) -> str:
 
 
 def _project_id(client) -> str | None:
-    for project in client.list_projects(project_name=PROJECT):
+    for project in client.list_projects(name=PROJECT):
         return str(project.id)
     return None
 
@@ -167,14 +167,16 @@ def _upsert_rule(client, payload: dict) -> None:
     name = payload["display_name"]
     if name in existing:
         response = client.request_with_retries(
-            "PATCH", f"/runs/rules/{existing[name]['id']}", data=payload
+            "PATCH", f"/runs/rules/{existing[name]['id']}", json=payload
         )
         verb = "updated"
     else:
-        response = client.request_with_retries("POST", "/runs/rules", data=payload)
+        response = client.request_with_retries("POST", "/runs/rules", json=payload)
         verb = "created"
     if response.status_code >= 400:
-        print(f"  FAILED to {verb[:-1]} {name!r}: {response.status_code} {response.text[:400]}")
+        print(
+            f"  FAILED to {verb[:-1]} {name!r}: {response.status_code} {response.text[:400]}"
+        )
         return
     print(f"  {verb} rule {name!r}")
 
@@ -221,7 +223,7 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 1.0,
-            "filter": 'eq(is_root, true)',
+            "filter": "eq(is_root, true)",
             "tree_filter": 'eq(name, "file_escalation")',
             "add_to_annotation_queue_id": str(queue.id),
         },
@@ -235,7 +237,7 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 1.0,  # deterministic and free; no reason to sample
-            "filter": 'eq(is_root, true)',
+            "filter": "eq(is_root, true)",
             "code_evaluators": [{"code": PII_EVALUATOR_CODE, "language": "python"}],
         },
     )
@@ -246,7 +248,7 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 0.2,  # a model call per trace; sample it
-            "filter": 'eq(is_root, true)',
+            "filter": "eq(is_root, true)",
             "evaluators": [
                 {
                     "structured": {

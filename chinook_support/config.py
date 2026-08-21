@@ -72,5 +72,11 @@ CHECKOUT_ALWAYS_REQUIRES_APPROVAL = True
 MAX_ROUTING_HOPS = 4
 #: Model calls per specialist, per run. Runaway-loop and cost protection.
 MAX_MODEL_CALLS_PER_RUN = 8
+#: Escalation is a short, fixed routine — look up the rep, file the ticket, tell the
+#: customer — so it gets a tighter ceiling than the open-ended areas. It was 4, which
+#: left no room for a tool retry: the eval suite caught a run that filed the ticket
+#: and then ran out of budget before it could say so, ending the turn on a raw
+#: "Model call limits exceeded" string. Six covers the routine plus one retry.
+MAX_MODEL_CALLS_ESCALATION = 6
 #: Catalog searches per run, so browsing can't grind.
 MAX_CATALOG_SEARCHES_PER_RUN = 6

@@ -24,10 +24,13 @@ from langchain.agents.middleware import (
     ToolCallRequest,
     ToolRetryMiddleware,
     dynamic_prompt,
+    hook_config,
 )
+from langchain_core.messages import AIMessage
 
 from .config import (
     MAX_CATALOG_SEARCHES_PER_RUN,
+    MAX_MODEL_CALLS_ESCALATION,
     MAX_MODEL_CALLS_PER_RUN,
     SUMMARY_MODEL,
 )
@@ -35,6 +38,61 @@ from .context import coerce_context
 from .db import get_customer
 from .policy import adjudicate
 from .security import AuditLogMiddleware, CustomerScopeMiddleware
+
+# --- Call ceiling -------------------------------------------------------------
+
+#: What the customer reads when an agent runs out of model calls mid-task.
+#:
+#: Deliberately non-committal about what got done. When the ceiling trips, some of
+#: the work may have landed and some may not — the run the eval suite caught had
+#: already filed the support case and then died before it could say so. Claiming
+#: either "that's done" or "nothing happened" would be a guess, and a support bot
+#: guessing about whether it refunded you is its own incident.
+BUDGET_EXCEEDED_REPLY = (
+    "Sorry — I ran out of steps on this one before I could wrap it up, so I'm not "
+    "certain everything went through. Ask me again and I'll pick it back up, or say "
+    "\"get me a person\" and I'll pass it to your support representative."
+)
+
+
+class CallBudgetMiddleware(ModelCallLimitMiddleware):
+    """`ModelCallLimitMiddleware`, except the customer doesn't read the diagnostic.
+
+    The stock middleware ends the run by injecting `Model call limits exceeded: run
+    limit (4/4)` as an assistant message. That is the right text for an operator and
+    the wrong text for the person who asked about their order — and because it is a
+    perfectly good AI message with content in it, every downstream "did anyone
+    answer?" check is satisfied by it, so it sails through as the final reply. The
+    eval suite caught exactly that.
+
+    The diagnostic is not thrown away; it moves to `additional_kwargs`, so it is
+    still on the message in the LangSmith trace where an operator will look for it.
+
+    The `hook_config` decorator has to be repeated here. It is what tells the graph
+    builder to wire a conditional edge to `end`, and it is read off the hook that is
+    actually overridden — inheriting the behaviour does not inherit the metadata.
+    Without it the wiring survives only because the *inherited async* hook still
+    carries the decorator, which is the same sync/async asymmetry that hid bug 1 in
+    the README, and it would fail silently: `jump_to: "end"` with no edge to take
+    means the ceiling stops nothing and the substituted reply lands mid-conversation.
+    """
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state, runtime):  # type: ignore[no-untyped-def]
+        result = super().before_model(state, runtime)
+        if not result or result.get("jump_to") != "end":
+            return result
+        diagnostic = " ".join(m.text for m in result.get("messages", []))
+        return {
+            **result,
+            "messages": [
+                AIMessage(
+                    content=BUDGET_EXCEEDED_REPLY,
+                    additional_kwargs={"call_budget_diagnostic": diagnostic},
+                )
+            ],
+        }
+
 
 # --- Human-in-the-loop predicates --------------------------------------------
 #
@@ -192,7 +250,7 @@ def billing_middleware() -> list[AgentMiddleware]:
             }
         ),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
-        ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
+        CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
     ]
 
 
@@ -230,7 +288,7 @@ def merch_middleware() -> list[AgentMiddleware]:
             keep=("messages", 12),
         ),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
-        ModelCallLimitMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
+        CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
     ]
 
 
@@ -246,5 +304,5 @@ def escalation_middleware() -> list[AgentMiddleware]:
         PIIMiddleware("email", strategy="redact", apply_to_output=True),
         PIIMiddleware("credit_card", strategy="redact", apply_to_output=True),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
-        ModelCallLimitMiddleware(run_limit=4, exit_behavior="end"),
+        CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_ESCALATION, exit_behavior="end"),
     ]
