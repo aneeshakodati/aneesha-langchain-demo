@@ -36,9 +36,9 @@ Everything below is implemented and verified unless marked otherwise.
 | Cross-thread cart persistence (Store) | Working. |
 | **LangGraph Studio** | **Verified.** `customer_id` renders as a form field and switching it genuinely changes the account served. |
 | `demo.py` — 7 self-asserting acts | Working. |
-| `tests/` — 74 tests | Passing in ~4.9s, offline. |
+| `tests/` — 96 tests | Passing in ~2.0s, offline. |
 | Eval dataset (35 cases, 8 adversarial) | **Uploaded to LangSmith.** |
-| Evaluators (4 deterministic + 1 judge) | **Run. Five full experiments, below.** |
+| Evaluators (4 deterministic + 1 judge) | **Run. Seven full experiments, below.** |
 | Annotation queue + online evaluators | **Built in code** (`evals/langsmith_setup.py`), not clicked together in the UI. |
 
 ### Not done / unverified
@@ -50,14 +50,14 @@ Everything below is implemented and verified unless marked otherwise.
   LangSmith, so git cannot tell you which version actually ran.
 - **Single-turn evals only.** Each dataset example is one customer message. The
   multi-turn journey is covered by `demo.py`, not by the eval suite.
-- **Run 6 has not happened.** The experiment table below ends at run 5. Since then
-  the escalation prompt gained severity-calibration guidance, the judge rubric was
-  brought into line with it, both judges were reordered to reason before scoring,
-  and `respond_prompt` moved out of `graph.py`. Every one of those is aimed at a
-  scored criterion, so every one of them *should* move a number — and none of them
-  has been measured. Treat the table as the state of run 5, not of `HEAD`. The
-  `conversational` slice was re-run locally and holds at 1.00; the `refund` slice
-  ran clean for five of eight examples before the API account ran out of credit.
+- **One example is not deterministic.** `refund-duplicate-charge` ("order 413 was a
+  duplicate charge") failed `policy_adherence` in run 7 and passed on an immediate
+  re-run of the slice. The agent looked at the order, saw six distinct tracks and no
+  repeat, told the customer it did not look like a duplicate, and asked before
+  refunding — where the evaluator expects the refund. Both readings are defensible,
+  which is the problem: the evaluator asserts one and the agent picks between them
+  per run. Either the case pins the behaviour in the prompt or it stops asserting on
+  it; leaving it is a known 1-in-8 flake on the safety evaluator.
 - `SqliteSaver`/`SqliteStore` are used for the CLI demo. Fine for a POC; a real
   deployment wants Postgres.
 - Tools are synchronous. See the `--allow-blocking` note under *Running it*.
@@ -68,19 +68,22 @@ Everything below is implemented and verified unless marked otherwise.
 
 The suite had never been run — there was no `LANGSMITH_API_KEY` during
 development, so the LangSmith half of this README was designed rather than
-demonstrated. It has now been run five times against the full dataset. This
+demonstrated. It has now been run seven times against the full dataset. This
 section is the log, because the deltas are the actual argument for owning an eval
 suite: **every single number that moved was a bug I did not know about.**
 
-| # | Experiment | leakage | policy | cart | route | judge |
-|---|---|---|---|---|---|---|
-| 1 | `chinook-full-ef44ddcc` — first run ever | 1.00 | 1.00 | 0.50 | 0.96 | 0.69 |
-| 2 | `chinook-full-62110013` — two evaluator fixes | 1.00 | 1.00 | **1.00** | 0.96 | 0.72 |
-| 3 | `chinook-full-1edfed31` — thinking-block fix + a bad prompt edit | 1.00 | 1.00 | 0.67 | **0.85** | 0.59 |
-| 4 | `chinook-full-3a16d385` — bad edit reverted, judge given evidence | 0.97 | 1.00 | 1.00 | **1.00** | 0.75 |
-| 5 | `chinook-full-89aae404` — the three agent defects fixed | **1.00** | 1.00 | 1.00 | 1.00 | **0.93** |
+| # | Experiment | leakage | policy | cart | route | judge | errors |
+|---|---|---|---|---|---|---|---|
+| 1 | `chinook-full-ef44ddcc` — first run ever | 1.00 | 1.00 | 0.50 | 0.96 | 0.69 | 0 |
+| 2 | `chinook-full-62110013` — two evaluator fixes | 1.00 | 1.00 | **1.00** | 0.96 | 0.72 | 0 |
+| 3 | `chinook-full-1edfed31` — thinking-block fix + a bad prompt edit | 1.00 | 1.00 | 0.67 | **0.85** | 0.59 | 0 |
+| 4 | `chinook-full-3a16d385` — bad edit reverted, judge given evidence | 0.97 | 1.00 | 1.00 | **1.00** | 0.75 | 0 |
+| 5 | `chinook-full-89aae404` — the three agent defects fixed | **1.00** | 1.00 | 1.00 | 1.00 | **0.93** | 0 |
+| 6 | `chinook-full-50137e33` — first run after the review commits | 1.00 | 1.00 | 0.83 | **0.70** | **0.00** | **11** |
+| 7 | `chinook-full-636f2781` — superstep ceiling derived from the right graph | 1.00 | 0.88\* | 1.00 | **1.00** | **0.98** | 0 |
 
-35/35 examples completed with zero harness errors on every run.
+\* One example, non-deterministic — it scores 1.00 on re-run. See *Not done /
+unverified*.
 
 **Run 1 → 2: two of the five evaluators were wrong, not the agent.**
 `cart_constraints_satisfied` failed three correct carts because it compared track
@@ -140,9 +143,9 @@ caught it on run 4, because until the thinking-block fix it was scanning a base6
 blob instead of the reply. A green evaluator was green for the wrong reason. Bug 4
 below.
 
-**Run 5 is the current state.** Four of the five evaluators are at 1.00 and the
-judge is at 0.93 — three criterion-level deductions across ten tickets, all of them
-on tickets that were correctly filed:
+**Run 5.** Four of the five evaluators are at 1.00 and the judge is at 0.93 — three
+criterion-level deductions across ten tickets, all of them on tickets that were
+correctly filed:
 
 - `adv-claimed-identity` loses `calibrated`, and the judge has a point. The ticket's
   own recommendation reads "possible social-engineering / account-probing attempt",
@@ -155,6 +158,47 @@ on tickets that were correctly filed:
   cannot carry a specific recommendation — the best it can say is "find out what
   they want". That is the right trade (a thin ticket beats no ticket) but it is a
   real cost of it, not a rounding error.
+
+**Run 6: eleven of thirty-five cases crashed, and the cause was a safety rail added
+to protect against exactly that.** Four commits went in after run 5 without the
+suite being re-run — an escalation audit record, a real checkout flag, prompt and
+judge revisions, and a `recursion_limit` on every invoke. The last one broke it:
+every failure was `GraphRecursionError: Recursion limit of 15 reached` inside
+`escalation_agent`. Route accuracy fell 1.00 → 0.70 and the escalation judge to
+0.00, the latter entirely downstream — the subgraph died before `file_escalation`
+ran, so the judge's own comments read `expected an escalation, none was filed`.
+
+The arithmetic behind the 15 was correct and measured the wrong graph. It counted
+supersteps in the *parent*: authenticate + four hops + finish + respond = 11, plus
+headroom. But `recursion_limit` propagates into subgraphs, each subgraph counts its
+own supersteps against it, and a subgraph cannot raise it back — `.with_config()`
+on a graph attached with `add_node` loses to the config coming down from the
+parent. A specialist is a `create_agent` loop that burns its whole middleware cycle
+per model call, and escalation's cycle is eight nodes deep against a six-call
+budget: ~51 supersteps, under a ceiling of 15. The same commit that set the ceiling
+also added `AuditLogMiddleware` to escalation, making the deepest stack deeper.
+
+Two things are worth saying plainly about how it shipped. The unit tests passed —
+including one named `test_the_ceiling_clears_a_full_hop_budget`, which asserted
+`11 <= 15 < 22` and never touched a specialist. It was the wrong measurement
+written down twice, in the constant and in the test that guarded it, so the test
+made the bug feel covered. And nothing else caught it: 74 offline tests, a clean
+`demo.py`, and a reviewed diff all went green on a change that broke a third of the
+suite. The eval run is what found it.
+
+**Run 7.** `GRAPH_RECURSION_LIMIT` is now longest specialist cycle × largest call
+budget, plus one cycle for the trip through `before_model` that finds the budget
+spent and exits — 72 rather than 15. It is deliberately loose for the parent graph:
+`MAX_ROUTING_HOPS` bounds the routing loop and `CallBudgetMiddleware` bounds each
+specialist, so the recursion limit is the backstop for when one of *those* breaks,
+which is the job the original comment claimed and the original number could not do.
+`tests/test_middleware.py` now derives both numbers from the compiled agents and
+asserts every specialist's worst case fits, so adding a middleware fails a test
+instead of a third of the dataset.
+
+Zero harness errors, route and cart back to 1.00, and the judge at its best yet —
+0.98, one `grounded` deduction on the adversarial identity ticket. The
+`policy_adherence` 0.88 is the flaky example described above, not a regression.
 
 Also new in run 5: two of the eight adversarial prompts now file a support case
 flagging the identity claim for a human. That is reasonable behaviour and it leaks
@@ -388,8 +432,9 @@ keeps working.*
 5. **Datasets.** 35 cases, 8 of them adversarial.
 6. **Experiments.** Run the suite; pass rates per evaluator.
 7. **Comparison.** Sonnet vs Haiku on `policy_adherence` (`make eval-haiku`); or
-   open runs 3 and 4 side by side for a real regression, caught and reverted —
-   see *What the experiments found*.
+   open runs 3 and 4 side by side for a prompt regression caught and reverted, or
+   6 and 7 for a safety rail that crashed a third of the dataset while the unit
+   tests stayed green — see *What the experiments found*.
 8. **Annotation queues.** A supervisor grades escalation summaries against a
    rubric; that feedback becomes new eval cases. Created by `make monitoring`.
 9. **Monitoring / online evals.** A deterministic PII check on every live trace
