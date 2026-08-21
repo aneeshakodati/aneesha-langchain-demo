@@ -16,8 +16,12 @@ in CI or offline. The evaluators don't know or care which mode they're in.
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import shutil
+import sqlite3
 import sys
+import tempfile
 import threading
 import uuid
 from collections import defaultdict
@@ -32,9 +36,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
 
 import chinook_support  # noqa: F401  (loads .env)
+from chinook_support.config import DEMO_DB
 from chinook_support.context import SupportContext
-from chinook_support.db import query, query_one, write_conn
-from chinook_support.graph import build_graph, text_of
+from chinook_support.db import query, query_one, use_db
+from chinook_support.graph import build_graph, run_config, text_of
 
 from evals.dataset import DATASET_NAME, build_examples
 from evals.evaluators import ALL_EVALUATORS
@@ -43,35 +48,66 @@ BOLD, DIM, GREEN, RED, YELLOW, RESET = (
     "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m",
 )
 
+# --- Per-example database isolation ------------------------------------------
+#
+# Examples mutate the store: they create refunds, support cases and orders. Run
+# two of them against one SQLite file and each one's writes are visible to the
+# other — example 3 refunding order 414 makes example 9's verdict
+# `already_refunded`, and a correct agent is graded as a failure.
+#
+# The first fix for that was a per-customer mutex plus a `DELETE FROM Refund`
+# before each run. It was correct, and it was slow for a structural reason: eleven
+# of the thirty-five cases are customer 1, so the busiest account ran strictly
+# serially no matter what `max_concurrency` said, and the suite's wall clock was
+# set by one lock.
+#
+# Copying the database per example removes the shared resource instead of queueing
+# for it. A copy is ~1MB and takes about a millisecond; the whole suite runs at
+# full concurrency, and isolation stops depending on remembering to add every new
+# mutable table to the reset list.
 
-def _reset_account(customer_id: int) -> None:
-    """Undo side effects from earlier examples so each case starts clean.
+_BASELINE_LOCK = threading.Lock()
+_BASELINE: Path | None = None
+_SCRATCH: Path | None = None
 
-    Without this, example 3 refunding order 414 makes example 9's verdict
-    `already_refunded` and the suite grades correct behavior as a failure. Eval
-    isolation is unglamorous and it is the difference between a suite you trust
-    and one you learn to ignore.
+
+def _scratch_dir() -> Path:
+    global _SCRATCH
+    if _SCRATCH is None:
+        _SCRATCH = Path(tempfile.mkdtemp(prefix="chinook-eval-"))
+        atexit.register(shutil.rmtree, _SCRATCH, True)
+    return _SCRATCH
+
+
+def _baseline_db() -> Path:
+    """One clean snapshot of the demo database. Every example copies this.
+
+    Snapshotted from the working `chinook_demo.db` rather than rebuilt from
+    `chinook.db`, because the seeded orders the dataset addresses by number (413,
+    414, 415, 416) only exist in the working copy and carry dates relative to when
+    `build_db.py` last ran. Refunds and support cases left behind by an earlier
+    demo run are cleared out of the snapshot, so every example starts from the
+    same known state whatever the developer did before running the suite.
     """
-    with write_conn() as conn:
-        conn.execute("DELETE FROM Refund WHERE CustomerId = ?", (customer_id,))
-        conn.execute("DELETE FROM SupportCase WHERE CustomerId = ?", (customer_id,))
+    global _BASELINE
+    with _BASELINE_LOCK:
+        if _BASELINE is None:
+            baseline = _scratch_dir() / "baseline.db"
+            shutil.copyfile(DEMO_DB, baseline)
+            conn = sqlite3.connect(baseline)
+            conn.execute("DELETE FROM Refund")
+            conn.execute("DELETE FROM SupportCase")
+            conn.commit()
+            conn.close()
+            _BASELINE = baseline
+    return _BASELINE
 
 
-#: One lock per customer, held for the whole of `target`.
-#:
-#: The reset above plus the side-effect reads at the end are a read-modify-write
-#: over rows keyed by customer, and LangSmith runs examples on a thread pool. Two
-#: concurrent examples for customer 1 — and eleven of the cases are customer 1 —
-#: would have one wipe the other's refund row mid-run, so a correct agent gets
-#: graded as a failure at random. Locking per customer keeps that serialized while
-#: still running different customers in parallel.
-_ACCOUNT_LOCKS: defaultdict[int, threading.Lock] = defaultdict(threading.Lock)
-_LOCKS_GUARD = threading.Lock()
-
-
-def _account_lock(customer_id: int) -> threading.Lock:
-    with _LOCKS_GUARD:
-        return _ACCOUNT_LOCKS[customer_id]
+def _private_db() -> Path:
+    """A private copy of the baseline, for exactly one example."""
+    path = _scratch_dir() / f"example-{uuid.uuid4().hex[:12]}.db"
+    shutil.copyfile(_baseline_db(), path)
+    return path
 
 
 def target(inputs: dict) -> dict:
@@ -81,18 +117,22 @@ def target(inputs: dict) -> dict:
     measure how the agent *describes* what it did; these let them grade what it
     actually did.
     """
-    with _account_lock(inputs["customer_id"]):
-        return _run_one(inputs)
+    db_path = _private_db()
+    with use_db(db_path):
+        outputs = _run_one(inputs)
+    # The evaluators need to read the same world this run acted in — the private
+    # copy outlives the run for exactly that reason, and is cleaned up at exit.
+    outputs["db_path"] = str(db_path)
+    return outputs
 
 
 def _run_one(inputs: dict) -> dict:
     customer_id = inputs["customer_id"]
-    _reset_account(customer_id)
 
     store = InMemoryStore()  # fresh cart per example
     graph = build_graph(checkpointer=InMemorySaver(), store=store)
     context = SupportContext(customer_id=customer_id, channel="web")
-    config = {"configurable": {"thread_id": f"eval-{uuid.uuid4().hex[:12]}"}}
+    config = run_config(f"eval-{uuid.uuid4().hex[:12]}")
 
     route_trail: list[str] = []
     interrupted = False
@@ -249,7 +289,10 @@ def run_langsmith(kind: str | None, limit: int | None, suffix: str) -> int:
         data=data,
         evaluators=ALL_EVALUATORS,
         experiment_prefix=suffix,
-        max_concurrency=4,
+        # Was 4, and even that was theatre: eleven cases shared one customer lock.
+        # With a private database per example the only remaining ceiling is the
+        # provider's rate limit.
+        max_concurrency=8,
         metadata={
             "agent_model": os.environ.get("AGENT_MODEL", "default"),
             "example_count": count,

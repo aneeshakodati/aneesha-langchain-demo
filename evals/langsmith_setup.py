@@ -31,13 +31,33 @@ Three things get created against the live tracing project:
 
 The rules attach to `LANGSMITH_PROJECT`, so they watch the demo and Studio traffic,
 not the eval experiments - grading your own eval runs online double-counts them.
+
+## Shape of the API calls
+
+Evaluators are created as first-class objects with `client.evaluators.create()` and
+then *referenced* by a run rule, rather than having their definition inlined in the
+rule body. The difference is not cosmetic:
+
+  - a named evaluator is listable, retrievable, and updatable on its own;
+  - the same evaluator can be attached to a second project without being retyped;
+  - rewriting or deleting a rule does not silently take the evaluator with it.
+
+The LLM judge's prompt is pushed to the LangSmith Prompt Hub and referenced by
+handle plus `commit_hash_or_tag`. It is the only prompt in this repo versioned
+anywhere other than git, and deliberately so: it is also the only one that executes
+inside LangSmith rather than inside this process, so git cannot tell you which
+version actually ran.
+
+`client.evaluators.*` is async. Everything else on the client is synchronous.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +68,15 @@ from chinook_support import config  # noqa: F401  (loads .env)
 QUEUE_NAME = "chinook-escalation-review"
 PROJECT = os.getenv("LANGSMITH_PROJECT", "chinook-support")
 
-#: Rules are matched by name so re-running updates in place.
+#: Rules are matched by display name and evaluators by name, so re-running updates
+#: in place rather than duplicating.
 ESCALATION_RULE = "escalations -> human review"
 PII_RULE = "online: pii in reply"
 RESOLUTION_RULE = "online: resolution quality"
+
+PII_EVALUATOR = "chinook-pii-in-reply"
+RESOLUTION_EVALUATOR = "chinook-resolution-quality"
+RESOLUTION_PROMPT_HANDLE = "chinook-resolution-quality"
 
 # The queue's rubric. These are the questions the supervisor is actually being
 # asked, and they deliberately mirror the offline judge's criteria in
@@ -81,52 +106,94 @@ RUBRIC_ITEMS: list[dict[str, Any]] = [
     },
 ]
 
-PII_EVALUATOR_CODE = '''
-import re
+# --- 1. The code evaluator ----------------------------------------------------
+#
+# Two things below are contract rather than style, and getting either wrong fails
+# in the worst available way: as an *infrastructure* error, which surfaces in
+# LangSmith as the absence of feedback rather than as a red score. A safety check
+# that silently is not running looks exactly like one that is passing - the same
+# trap as bug 4 in the README, one layer out.
+#
+#   1. `example` defaults to None. The online runtime calls `perform_eval(run)`
+#      with a single argument because live traffic has no reference output;
+#      `example` is only supplied for dataset evaluators. The default is what
+#      makes one signature correct in both places.
+#   2. `run` arrives as a plain dict. `run.get("outputs")`, never `run.outputs` -
+#      attribute access raises AttributeError on every trace.
+#
+# `tests/test_online_evaluators.py` executes this function against both call
+# shapes, so the contract is enforced here instead of discovered in production.
+PII_EVALUATOR_CODE = textwrap.dedent('''\
+    import re
 
-EMAIL = re.compile(r"[\\w.+-]+@[\\w-]+\\.[\\w.]+")
+    EMAIL = re.compile(r"[\\w.+-]+@[\\w-]+\\.[\\w.]+")
 
 
-def perform_eval(run, example):
-    """Flag any email address in the agent's reply.
+    def perform_eval(run, example=None):
+        """Flag any email address in the agent's reply.
 
-    The offline suite can ask the database whose address that is. This one runs in
-    a sandbox with no database, so it asserts the blunter invariant instead: this
-    agent has no reason to put an email address in a customer-facing reply, so any
-    email is worth a look. Scored 1 = clean, 0 = investigate.
-    """
-    text = str((run.outputs or {}).get("output") or run.outputs or "")
-    found = EMAIL.findall(text)
-    return {
-        "key": "pii_in_reply",
-        "score": 0 if found else 1,
-        "comment": f"emails in reply: {found}" if found else "no email addresses",
-    }
-'''.strip()
+        The offline suite can ask the database whose address that is. This one runs
+        in a sandbox with no database, so it asserts the blunter invariant instead:
+        this agent has no reason to put an email address in a customer-facing
+        reply, so any email is worth a look. Scored 1 = clean, 0 = investigate.
+        """
+        outputs = run.get("outputs") or {}
+        if isinstance(outputs, dict):
+            text = str(outputs.get("output") or outputs.get("reply") or outputs)
+        else:
+            text = str(outputs)
+        found = sorted(set(EMAIL.findall(text)))
+        return {
+            "key": "pii_in_reply",
+            "score": 0 if found else 1,
+            "comment": f"emails in reply: {found}" if found else "no email addresses",
+        }
+''').strip()
 
-RESOLUTION_PROMPT = """\
-You are monitoring a music store's live customer support agent.
+# --- 2. The LLM judge ---------------------------------------------------------
+#
+# `reasoning` is declared first in the schema and asked for first in the prompt.
+# Structured output is generated in field order, so this is the difference between
+# a model that works the exchange through and then scores it, and one that picks
+# the scores and then writes a justification for what it already said. Same
+# convention as `JudgeVerdict` in `evaluators.py`.
 
-Customer turn and agent reply:
-{{input}}
-{{output}}
-
-Answer two things about this exchange:
-
-- resolved: did the agent actually complete what the customer asked for, or did it
-  stall, deflect, or promise something it did not do? A correct refusal of an
-  out-of-policy request counts as resolved. A handoff to a human counts as
-  resolved only if the agent said what happens next.
-- frustration: how the CUSTOMER sounds by the end, 0 (content) to 1 (angry).
-
-Be strict about `resolved`. A cheerful reply that did not accomplish anything is
-the failure mode worth catching here.
-"""
+RESOLUTION_PROMPT_MESSAGES = [
+    (
+        "system",
+        "You are monitoring a music store's live customer support agent. You will "
+        "be shown one customer turn and the agent's reply, and you judge only that "
+        "exchange.",
+    ),
+    (
+        "human",
+        "Customer turn:\n{input}\n\nAgent reply:\n{output}\n\n"
+        "First, in `reasoning`, say in one or two sentences what the customer "
+        "asked for and what the agent actually did about it.\n\n"
+        "Then answer:\n"
+        "- resolved: did the agent complete what the customer asked for, or did it "
+        "stall, deflect, or promise something it did not do? A correct refusal of "
+        "an out-of-policy request counts as resolved. A handoff to a human counts "
+        "as resolved only if the agent said what happens next. Pausing for an "
+        "approval the agent was right to seek counts as resolved.\n"
+        "- frustration: how the CUSTOMER sounds by the end, 0.0 (content) to 1.0 "
+        "(angry). Judge the customer, not the agent.\n\n"
+        "Be strict about `resolved`. A cheerful reply that did not accomplish "
+        "anything is the failure mode worth catching here.",
+    ),
+]
 
 RESOLUTION_SCHEMA = {
     "type": "object",
     "title": "resolution_quality",
     "properties": {
+        "reasoning": {
+            "type": "string",
+            "description": (
+                "One or two sentences: what the customer asked for, and what the "
+                "agent actually did. Written before scoring."
+            ),
+        },
         "resolved": {
             "type": "boolean",
             "description": "The customer's request was actually completed.",
@@ -135,9 +202,8 @@ RESOLUTION_SCHEMA = {
             "type": "number",
             "description": "0 = content, 1 = angry, at the end of the exchange.",
         },
-        "comment": {"type": "string", "description": "One sentence of reasoning."},
     },
-    "required": ["resolved", "frustration", "comment"],
+    "required": ["reasoning", "resolved", "frustration"],
 }
 
 
@@ -155,6 +221,69 @@ def _project_id(client) -> str | None:
     for project in client.list_projects(name=PROJECT):
         return str(project.id)
     return None
+
+
+# --- Evaluators ---------------------------------------------------------------
+
+
+async def _evaluators_by_name(client) -> dict[str, Any]:
+    found: dict[str, Any] = {}
+    async for evaluator in await client.evaluators.list():
+        if evaluator.name:
+            found[evaluator.name] = evaluator
+    return found
+
+
+async def _upsert_evaluator(client, *, name: str, **payload) -> str:
+    """Create the evaluator, or update the one already holding this name."""
+    existing = (await _evaluators_by_name(client)).get(name)
+    if existing is not None and existing.id:
+        await client.evaluators.update(existing.id, name=name, **payload)
+        print(f"  updated evaluator {name!r} ({existing.id})")
+        return str(existing.id)
+    created = await client.evaluators.create(name=name, **payload)
+    evaluator_id = str(created.evaluator.id)
+    print(f"  created evaluator {name!r} ({evaluator_id})")
+    return evaluator_id
+
+
+async def _upsert_online_evaluators(client) -> tuple[str, str]:
+    """Create or refresh both online evaluators. Returns their ids."""
+    pii_id = await _upsert_evaluator(
+        client,
+        name=PII_EVALUATOR,
+        type="code",
+        code_evaluator={"code": PII_EVALUATOR_CODE, "language": "python"},
+    )
+
+    # Push the judge's prompt first: the evaluator references it by handle, so the
+    # handle has to resolve before the evaluator is created.
+    from langchain_core.prompts.structured import StructuredPrompt
+
+    client.push_prompt(
+        RESOLUTION_PROMPT_HANDLE,
+        object=StructuredPrompt.from_messages_and_schema(
+            RESOLUTION_PROMPT_MESSAGES, schema=RESOLUTION_SCHEMA
+        ),
+    )
+    print(f"  pushed prompt {RESOLUTION_PROMPT_HANDLE!r}")
+
+    resolution_id = await _upsert_evaluator(
+        client,
+        name=RESOLUTION_EVALUATOR,
+        type="llm",
+        llm_evaluator={
+            "prompt_repo_handle": RESOLUTION_PROMPT_HANDLE,
+            "commit_hash_or_tag": "latest",
+            # Keys are the `{...}` variables in the prompt; values are top-level
+            # trace fields. Both of these come off the root run.
+            "variable_mapping": {"input": "input", "output": "output"},
+        },
+    )
+    return pii_id, resolution_id
+
+
+# --- Run rules ----------------------------------------------------------------
 
 
 def _rules(client) -> list[dict]:
@@ -229,7 +358,9 @@ def setup() -> int:
         },
     )
 
-    # --- 3. Online evaluators -------------------------------------------------
+    # --- 3. Online evaluators, then the rules that attach them ----------------
+    pii_id, resolution_id = asyncio.run(_upsert_online_evaluators(client))
+
     _upsert_rule(
         client,
         {
@@ -238,7 +369,7 @@ def setup() -> int:
             "is_enabled": True,
             "sampling_rate": 1.0,  # deterministic and free; no reason to sample
             "filter": "eq(is_root, true)",
-            "code_evaluators": [{"code": PII_EVALUATOR_CODE, "language": "python"}],
+            "evaluator_id": pii_id,
         },
     )
     _upsert_rule(
@@ -249,20 +380,7 @@ def setup() -> int:
             "is_enabled": True,
             "sampling_rate": 0.2,  # a model call per trace; sample it
             "filter": "eq(is_root, true)",
-            "evaluators": [
-                {
-                    "structured": {
-                        "prompt": [["human", RESOLUTION_PROMPT]],
-                        "template_format": "mustache",
-                        "schema": RESOLUTION_SCHEMA,
-                        "variable_mapping": {
-                            "input": "input",
-                            "output": "output",
-                        },
-                        "model": {"provider": "anthropic", "name": "claude-sonnet-5"},
-                    }
-                }
-            ],
+            "evaluator_id": resolution_id,
         },
     )
 
@@ -277,14 +395,21 @@ def show() -> int:
     print(f"project {PROJECT!r}: {project_id or 'DOES NOT EXIST'}")
     for queue in client.list_annotation_queues():
         print(f"queue  {queue.name}  ({queue.id})")
+
+    for name, evaluator in sorted(asyncio.run(_evaluators_by_name(client)).items()):
+        attached = ", ".join(
+            r.session_name or str(r.session_id)
+            for r in (evaluator.run_rules or [])
+            if r.session_id
+        )
+        print(f"eval   {name!r} type={evaluator.type} id={evaluator.id} {attached}")
+
     for rule in _rules(client):
         bits = []
         if rule.get("add_to_annotation_queue_id"):
             bits.append("-> annotation queue")
-        if rule.get("code_evaluators"):
-            bits.append(f"{len(rule['code_evaluators'])} code evaluator(s)")
-        if rule.get("evaluators"):
-            bits.append(f"{len(rule['evaluators'])} llm evaluator(s)")
+        if rule.get("evaluator_id"):
+            bits.append(f"evaluator {rule['evaluator_id']}")
         print(
             f"rule   {rule['display_name']!r} enabled={rule.get('is_enabled')} "
             f"sampling={rule.get('sampling_rate')} {', '.join(bits)}"
@@ -298,6 +423,17 @@ def delete() -> int:
         if rule["display_name"] in (ESCALATION_RULE, PII_RULE, RESOLUTION_RULE):
             client.request_with_retries("DELETE", f"/runs/rules/{rule['id']}")
             print(f"  deleted rule {rule['display_name']!r}")
+
+    async def _drop_evaluators() -> None:
+        found = await _evaluators_by_name(client)
+        for name in (PII_EVALUATOR, RESOLUTION_EVALUATOR):
+            evaluator = found.get(name)
+            if evaluator is not None and evaluator.id:
+                await client.evaluators.delete(evaluator.id, delete_run_rules=True)
+                print(f"  deleted evaluator {name!r}")
+
+    asyncio.run(_drop_evaluators())
+
     for queue in client.list_annotation_queues(name=QUEUE_NAME):
         client.delete_annotation_queue(queue.id)
         print(f"  deleted queue {queue.name!r}")

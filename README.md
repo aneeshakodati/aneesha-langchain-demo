@@ -36,17 +36,28 @@ Everything below is implemented and verified unless marked otherwise.
 | Cross-thread cart persistence (Store) | Working. |
 | **LangGraph Studio** | **Verified.** `customer_id` renders as a form field and switching it genuinely changes the account served. |
 | `demo.py` — 7 self-asserting acts | Working. |
-| `tests/` — 42 tests | Passing in ~0.4s. |
+| `tests/` — 74 tests | Passing in ~4.9s, offline. |
 | Eval dataset (35 cases, 8 adversarial) | **Uploaded to LangSmith.** |
 | Evaluators (4 deterministic + 1 judge) | **Run. Five full experiments, below.** |
 | Annotation queue + online evaluators | **Built in code** (`evals/langsmith_setup.py`), not clicked together in the UI. |
 
 ### Not done / unverified
 
-- **No prompt-versioning story.** Prompts live in `prompts.py` and are versioned
-  by git, not by LangSmith's prompt hub.
+- **Prompt versioning is git, mostly.** Every prompt the agent uses lives in
+  `prompts.py` and is versioned by git, not by LangSmith's prompt hub. The one
+  exception is the online resolution judge, which `langsmith_setup.py` pushes to
+  the hub and references by handle — because that prompt executes *inside*
+  LangSmith, so git cannot tell you which version actually ran.
 - **Single-turn evals only.** Each dataset example is one customer message. The
   multi-turn journey is covered by `demo.py`, not by the eval suite.
+- **Run 6 has not happened.** The experiment table below ends at run 5. Since then
+  the escalation prompt gained severity-calibration guidance, the judge rubric was
+  brought into line with it, both judges were reordered to reason before scoring,
+  and `respond_prompt` moved out of `graph.py`. Every one of those is aimed at a
+  scored criterion, so every one of them *should* move a number — and none of them
+  has been measured. Treat the table as the state of run 5, not of `HEAD`. The
+  `conversational` slice was re-run locally and holds at 1.00; the `refund` slice
+  ran clean for five of eight examples before the API account ran out of credit.
 - `SqliteSaver`/`SqliteStore` are used for the CLI demo. Fine for a POC; a real
   deployment wants Postgres.
 - Tools are synchronous. See the `--allow-blocking` note under *Running it*.
@@ -253,9 +264,9 @@ one-line task description.
 1. *Tool-selection accuracy.* Each specialist sees 4–6 tools instead of 13. Tool
    confusion is the most common way agents fail in production — not hallucination,
    just calling the wrong function.
-2. *Policy differs by area.* Billing needs human approval and an audit trail;
-   merch needs a search budget and summarization; escalation needs PII redaction.
-   A flat agent pays for all of it on every request.
+2. *Policy differs by area.* Billing needs human approval; merch needs a search
+   budget and summarization; escalation needs PII redaction. A flat agent pays for
+   all of it on every request.
 
 **`create_agent()`, not `create_deep_agent()`.** Deep Agents' planning loop,
 virtual filesystem, and subagent spawning are built for long autonomous research
@@ -334,11 +345,13 @@ architecture.
 | Middleware | Where | Why |
 |---|---|---|
 | `CustomerScopeMiddleware` (custom) | all | tenant isolation guard, above |
-| `AuditLogMiddleware` (custom) | billing, merch | write-path accountability — "the agent did it" is not an answer to "why does this order exist?" |
+| `AuditLogMiddleware` (custom) | all | write-path accountability — "the agent did it" is not an answer to "why does this order exist?" `file_escalation` creates an obligation a human has to honour, so escalation is audited on the same terms as the two money-moving paths |
 | `@dynamic_prompt` | all | injects the authenticated name/location/rep at request time, so the prompt is structurally incapable of being about the wrong person |
 | `HumanInTheLoopMiddleware` + `when` | billing, merch | interrupt only when it matters. `InterruptOnConfig.when` receives the real `ToolCallRequest`, so the gate runs the actual policy engine — a $4 refund goes straight through, a $25.74 one stops |
 | `ToolRetryMiddleware` | all | transient DB faults, exponential backoff |
+| `ModelRetryMiddleware` | all | the other half of the same problem. Tools were retried and model calls weren't, and a specialist makes more model calls than tool calls — so a 429 between two tools ended the turn. Retrying the *model call* rather than the graph node matters: a node retry re-runs the specialist from the top, and `file_escalation` would file a second ticket |
 | `ModelCallLimitMiddleware` | all | runaway-loop and cost ceiling |
+| `recursion_limit` (graph config) | every invoke, via `run_config()` | the same ceiling one level up, on supersteps rather than model calls. The hop limit already bounds the loop, so this only fires when *that* is broken — which is the case worth having an error for rather than a slow, expensive turn. Derived from `MAX_ROUTING_HOPS` in `config.py`, and built by `run_config()` so the demo and the eval harness can't drift apart |
 | `ToolCallLimitMiddleware` | merch | caps `search_catalog`; browsing is the one flow that genuinely runs away |
 | `SummarizationMiddleware` | merch | long browse sessions are the only place context gets tight |
 | `PIIMiddleware` | escalation | scrub contact details from tickets that leave the system — the prompt already says not to include them, but a prompt is not a control |
@@ -387,6 +400,13 @@ to code review and untransferable to a second workspace. `evals/langsmith_setup.
 creates them through the API instead, idempotently, so they live in git with
 everything else.
 
+The evaluators are created as **named objects** (`client.evaluators.create`) and
+then referenced by a run rule, rather than having their bodies inlined in the rule.
+An inlined evaluator only exists inside one rule: it can't be listed, can't be
+attached to a second project without retyping it, and disappears if the rule is
+rewritten — which is the same "invisible to code review" problem this script exists
+to solve, one level down.
+
 **Is LangSmith important?** Yes, and specifically because agents fail
 *non-deterministically and silently*. A unit test tells you a function returns 4.
 Nothing in the OSS stack tells you your refund agent got 8% more permissive when
@@ -420,6 +440,18 @@ Evaluators grade **side effects**, not prose. `run_eval.target` returns whether 
 resulting cart. Grading the reply's wording measures how the agent *describes*
 what it did.
 
+Grading side effects means the examples *have* side effects, which makes isolation
+a real problem rather than a hygiene one: run two examples against one SQLite file
+and example 3 refunding order 414 makes example 9's verdict `already_refunded`, so
+a correct agent is graded as a failure. The first fix was a per-customer mutex,
+which was correct and slow — eleven of the thirty-five cases are customer 1, so the
+busiest account ran strictly serially whatever `max_concurrency` said. Each example
+now gets a private ~1MB copy of the database instead (`chinook_support.db.use_db`,
+a ContextVar so a worker thread binds only itself), and the evaluators bind to the
+same copy via `db_path` in the run's outputs. The shared resource is gone rather
+than queued for, and isolation no longer depends on remembering to add every new
+mutable table to a reset list.
+
 ---
 
 ## Running it
@@ -430,7 +462,7 @@ cp .env.example .env   # add ANTHROPIC_API_KEY (and LANGSMITH_API_KEY for tracin
 
 make studio       # LangGraph Studio  <- the live demo
 make demo         # scripted 7-act CLI, self-asserting
-make test         # 42 unit tests, ~0.4s
+make test         # 74 unit tests, ~4.9s, no network
 make dataset      # push the eval dataset to LangSmith
 make eval         # run the suite as a LangSmith experiment
 make eval-haiku   # the same suite on the cheap model, for the comparison view
@@ -465,7 +497,7 @@ the run, saved carts, and conversation history.
 
 ---
 
-## Five bugs worth knowing about
+## Six bugs worth knowing about
 
 Each was caught during development, and each would have broken the live demo.
 They're the most useful part of this repo if you're building something similar.
@@ -512,6 +544,23 @@ They're the most useful part of this repo if you're building something similar.
    construction. Config read at import time is a trap wherever anything wants to
    override it later.
 
+6. **The always-on safety check had never run.** The online PII evaluator is
+   attached at `sampling_rate: 1.0` and described above as watching every live
+   trace. It was watching nothing. LangSmith calls a code evaluator as
+   `perform_eval(run)` with `run` as a plain **dict**; this one was written as
+   `perform_eval(run, example)` reading `run.outputs`, so every invocation raised
+   `TypeError` and then `AttributeError`. Neither shows up as a red score — a
+   crashed evaluator is an *infrastructure* error, so LangSmith records no feedback
+   at all and the column is simply empty. An empty column reads as "nothing to
+   report."
+
+   This is bug 4 one layer out, and the same lesson: a green check is only as
+   trustworthy as the evidence that it ran. The signature is now
+   `perform_eval(run, example=None)` over `run.get("outputs")`, and
+   `tests/test_online_evaluators.py` compiles the deployed *string* and calls it
+   the way the sandbox does — including on errored runs with no outputs at all,
+   because an evaluator that crashes on one bad trace stops scoring the good ones.
+
 ---
 
 ## Layout
@@ -533,9 +582,8 @@ evals/            dataset.py, evaluators.py, run_eval.py
                   langsmith_setup.py  annotation queue + online evaluators, in code
 scripts/          build_db.py, reset_demo.py
 tests/            test_policy.py, test_cart.py, test_scoping.py, test_middleware.py
+                  test_prompts.py, test_online_evaluators.py
 demo.py           scripted 7-act demo
 langgraph.json    Studio entrypoint
 ```
 
-`langgraph-agent/` is an unrelated quickstart scratchpad from before this project
-and isn't part of it.

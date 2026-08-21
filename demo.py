@@ -28,7 +28,7 @@ import chinook_support  # noqa: F401  (loads .env, installs warning filters)
 from chinook_support.config import CHECKPOINT_DB, STORE_DB
 from chinook_support.context import SupportContext
 from chinook_support.db import query, query_one
-from chinook_support.graph import build_graph, text_of
+from chinook_support.graph import build_graph, run_config, text_of
 from chinook_support.security import find_foreign_emails
 
 RESET = "\033[0m"
@@ -82,7 +82,7 @@ class Session:
     def __init__(self, graph, customer_id: int, thread_id: str, channel="web"):
         self.graph = graph
         self.context = SupportContext(customer_id=customer_id, channel=channel)
-        self.config = {"configurable": {"thread_id": thread_id}}
+        self.config = run_config(thread_id)
 
     def say(self, text: str, *, show=True) -> dict:
         if show:

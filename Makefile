@@ -43,4 +43,8 @@ monitoring:  ## create the annotation queue and online evaluators (idempotent)
 	$(PY) evals/langsmith_setup.py
 
 clean:
-	rm -rf .langgraph_api **/__pycache__ .pytest_cache *.egg-info
+	@# `**/__pycache__` needs globstar, and make runs recipes under /bin/sh, so the
+	@# glob used to reach exactly one level and leave the rest behind.
+	rm -rf .langgraph_api .pytest_cache .ruff_cache *.egg-info
+	find . -path ./$(VENV) -prune -o -name __pycache__ -type d -print0 \
+		| xargs -0 rm -rf

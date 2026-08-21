@@ -79,12 +79,13 @@ def build_merch_agent():
 def build_escalation_agent():
     """Handoff to the customer's assigned human representative.
 
-    The ticket's shape is enforced by `file_escalation`'s own signature — Literal
-    enums for category/severity/sentiment plus required narrative fields — so the
-    schema is validated at the tool boundary and the structured record is visible
-    both in the trace and in the SupportCase table. That leaves the agent's final
-    message free to be ordinary prose addressed to the customer, which is what the
-    parent graph needs to return.
+    The ticket's shape is enforced by `file_escalation`'s own signature — required
+    narrative fields, plus category/severity/sentiment normalized onto a fixed
+    vocabulary at the tool boundary rather than rejected by a strict enum (see the
+    comment there; a strict enum once dropped a ticket outright). So the structured
+    record is validated where it is written and is visible both in the trace and in
+    the SupportCase table. That leaves the agent's final message free to be ordinary
+    prose addressed to the customer, which is what the parent graph needs to return.
     """
     return create_agent(
         model=agent_model(),

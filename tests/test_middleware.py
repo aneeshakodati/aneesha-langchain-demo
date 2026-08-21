@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import pytest
 from langchain.agents.factory import _get_can_jump_to
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 
+from chinook_support import middleware as mw
+from chinook_support.config import GRAPH_RECURSION_LIMIT, MAX_ROUTING_HOPS
+from chinook_support.graph import run_config
 from chinook_support.middleware import BUDGET_EXCEEDED_REPLY, CallBudgetMiddleware
+from chinook_support.security import AuditLogMiddleware
 
 
 @pytest.fixture
@@ -82,3 +87,73 @@ def test_the_jump_edge_is_still_wired(budget):
     """
     assert _get_can_jump_to(budget, "before_model") == ["end"]
     assert CallBudgetMiddleware.before_model.__can_jump_to__ == ["end"]
+
+
+# --- Stack composition --------------------------------------------------------
+#
+# A stack is a list literal, so a control goes missing by omission rather than by
+# breaking anything — nothing fails, the record just isn't written. These assert the
+# claims the docstrings make about the stacks.
+
+
+@pytest.mark.parametrize(
+    "build",
+    [mw.billing_middleware, mw.merch_middleware, mw.escalation_middleware],
+    ids=["billing", "merch", "escalation"],
+)
+def test_every_specialist_is_audited(build):
+    """`file_escalation` is a write path too.
+
+    Escalation was the one stack without the audit middleware, so tickets got filed
+    with no record of who asked for them — while `AuditLogMiddleware`'s own docstring
+    named `file_escalation` as one of the three paths it covers.
+    """
+    assert any(isinstance(m, AuditLogMiddleware) for m in build())
+
+
+def test_the_audit_record_says_which_area_wrote_it():
+    (audit,) = [m for m in mw.escalation_middleware() if isinstance(m, AuditLogMiddleware)]
+    assert audit.area == "escalation"
+
+
+def _checkout_is_gated(stack) -> bool:
+    """Is `checkout_cart` on the interrupt list?
+
+    The middleware normalises its config and drops the tools configured `False`, so
+    an ungated tool is an absent key rather than a falsy value.
+    """
+    (hitl,) = [m for m in stack if isinstance(m, HumanInTheLoopMiddleware)]
+    return "checkout_cart" in hitl.interrupt_on
+
+
+def test_checkout_is_gated():
+    assert _checkout_is_gated(mw.merch_middleware())
+
+
+def test_the_checkout_policy_constant_is_the_thing_that_decides(monkeypatch):
+    """`CHECKOUT_ALWAYS_REQUIRES_APPROVAL` was a constant nothing imported.
+
+    It read as the switch controlling checkout approval while the real gate was
+    hard-coded in the stack, so editing it changed nothing. Flip it and the gate has
+    to move, or it is decoration again.
+    """
+    monkeypatch.setattr(mw, "CHECKOUT_ALWAYS_REQUIRES_APPROVAL", False)
+    assert not _checkout_is_gated(mw.merch_middleware())
+
+
+# --- Superstep ceiling --------------------------------------------------------
+
+
+def test_every_run_carries_a_recursion_limit():
+    assert run_config("t")["recursion_limit"] == GRAPH_RECURSION_LIMIT
+    assert run_config("t")["configurable"]["thread_id"] == "t"
+
+
+def test_the_ceiling_clears_a_full_hop_budget():
+    """It has to bound a runaway loop without tripping on a legitimate long turn.
+
+    authenticate + MAX_ROUTING_HOPS x (supervisor + specialist) + a final supervisor
+    + respond is the worst case the hop limit permits.
+    """
+    worst_case = 1 + 2 * MAX_ROUTING_HOPS + 1 + 1
+    assert worst_case <= GRAPH_RECURSION_LIMIT < worst_case * 2

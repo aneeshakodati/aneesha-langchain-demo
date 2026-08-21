@@ -2,9 +2,10 @@
 
 The stacks are deliberately different from each other, and that difference is the
 argument for splitting the agent into specialists in the first place. Billing moves
-money, so it gets human approval and an audit trail. Merch runs long browsing
-sessions, so it gets a search budget and conversation summarization. Escalation
-emits a record that leaves the system, so it gets PII redaction.
+money, so it gets human approval. Merch runs long browsing sessions, so it gets a
+search budget and conversation summarization. Escalation emits a record that leaves
+the system, so it gets PII redaction. All three write to the customer's account, so
+all three carry the audit log.
 
 A single flat agent would have to carry the union of all of it on every request:
 paying the summarization check on a one-line refund question, and running the
@@ -18,6 +19,7 @@ from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
     ModelCallLimitMiddleware,
     ModelRequest,
+    ModelRetryMiddleware,
     PIIMiddleware,
     SummarizationMiddleware,
     ToolCallLimitMiddleware,
@@ -29,10 +31,11 @@ from langchain.agents.middleware import (
 from langchain_core.messages import AIMessage
 
 from .config import (
+    CHECKOUT_ALWAYS_REQUIRES_APPROVAL,
     MAX_CATALOG_SEARCHES_PER_RUN,
     MAX_MODEL_CALLS_ESCALATION,
     MAX_MODEL_CALLS_PER_RUN,
-    SUMMARY_MODEL,
+    summary_model,
 )
 from .context import coerce_context
 from .db import get_customer
@@ -221,6 +224,42 @@ def with_customer_profile(base_prompt: str) -> AgentMiddleware:
     return _prompt
 
 
+# --- Transient faults ---------------------------------------------------------
+
+
+def model_retry() -> AgentMiddleware:
+    """Retry the specialist's *model* call, the way `ToolRetryMiddleware` retries
+    its tools.
+
+    Only half of each specialist was covered. `ToolRetryMiddleware` caught a flaky
+    SQLite read, but a 429 or a dropped connection on the model call itself went
+    straight up and ended the turn — and a specialist makes more model calls than
+    tool calls, so the uncovered half was the likelier one to fail.
+
+    This belongs here rather than as `add_node(retry_policy=...)` on the graph, and
+    rather than as `.with_retry()` on the model:
+
+    - A node-level retry re-runs the whole specialist from its first message. If
+      the failure happened after `issue_refund` returned, the retry re-runs a tool
+      that has already moved money. (`issue_refund` re-adjudicates and would refuse
+      the second attempt, but `file_escalation` would happily file a second ticket.)
+      Retrying the model call alone cannot duplicate a side effect that has already
+      landed.
+    - `.with_retry()` wraps the model in a `RunnableRetry`, which has no
+      `bind_tools`, so `create_agent` cannot use it. Worth writing down: it looks
+      correct and fails only once an agent actually tries to call a tool.
+
+    `on_failure="continue"` so an exhausted retry surfaces as an error message the
+    agent can tell the customer about, rather than a stack trace mid-conversation.
+    """
+    return ModelRetryMiddleware(
+        max_retries=2,  # 3 attempts total, matching the router
+        initial_delay=0.5,
+        backoff_factor=2.0,
+        on_failure="continue",
+    )
+
+
 # --- Stacks ------------------------------------------------------------------
 #
 # Order matters. CustomerScopeMiddleware is first so its pre-execution check runs
@@ -250,6 +289,7 @@ def billing_middleware() -> list[AgentMiddleware]:
             }
         ),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
+        model_retry(),
         CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
     ]
 
@@ -263,10 +303,18 @@ def merch_middleware() -> list[AgentMiddleware]:
         with_customer_profile(MERCH_PROMPT),
         HumanInTheLoopMiddleware(
             interrupt_on={
-                "checkout_cart": {
-                    "allowed_decisions": ["approve", "reject"],
-                    "description": describe_checkout,
-                },
+                # Unlike the refund gate, this one has no `when`: checkout creates a
+                # real order at any amount, so the policy is a flat "always" and it
+                # lives in config.py with the other thresholds rather than being
+                # hard-coded here.
+                "checkout_cart": (
+                    {
+                        "allowed_decisions": ["approve", "reject"],
+                        "description": describe_checkout,
+                    }
+                    if CHECKOUT_ALWAYS_REQUIRES_APPROVAL
+                    else False
+                ),
                 "search_catalog": False,
                 "build_music_cart": False,
                 "view_cart": False,
@@ -283,11 +331,12 @@ def merch_middleware() -> list[AgentMiddleware]:
         ),
         # Long browse sessions are the only place context actually gets tight.
         SummarizationMiddleware(
-            model=SUMMARY_MODEL,
+            model=summary_model(),
             trigger=("tokens", 60_000),
             keep=("messages", 12),
         ),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
+        model_retry(),
         CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_PER_RUN, exit_behavior="end"),
     ]
 
@@ -297,6 +346,11 @@ def escalation_middleware() -> list[AgentMiddleware]:
 
     return [
         CustomerScopeMiddleware(),
+        # `file_escalation` is a write path like `issue_refund` and `checkout_cart`:
+        # it creates an obligation a human downstream has to honour. It gets the same
+        # audit record for the same reason — "the agent filed it" is not an answer to
+        # "why does this ticket exist?".
+        AuditLogMiddleware(area="escalation"),
         with_customer_profile(ESCALATION_PROMPT),
         # A support case is read by a human and may be exported to a ticketing
         # system, so scrub contact details on the way out even though the prompt
@@ -304,5 +358,6 @@ def escalation_middleware() -> list[AgentMiddleware]:
         PIIMiddleware("email", strategy="redact", apply_to_output=True),
         PIIMiddleware("credit_card", strategy="redact", apply_to_output=True),
         ToolRetryMiddleware(max_retries=2, initial_delay=0.5),
+        model_retry(),
         CallBudgetMiddleware(run_limit=MAX_MODEL_CALLS_ESCALATION, exit_behavior="end"),
     ]

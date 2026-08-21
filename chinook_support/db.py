@@ -1,21 +1,66 @@
 """Database access.
 
-Two rules, enforced structurally rather than by convention:
+Three rules, enforced structurally rather than by convention:
 
 1. Reads go through a connection opened in SQLite read-only mode. A bug in a
    "read" tool cannot mutate anything, because the file handle won't allow it.
 2. Every query is parameterized. There is no string interpolation of values
    anywhere in this package, and no tool exposes SQL to the model.
+3. *Which* database is in play is a per-context decision, not a global one. See
+   `use_db` below.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterator
 
 from .config import DEMO_DB
+
+#: The database this context is bound to. `None` means "the shared demo database",
+#: which is what the CLI demo and Studio always want.
+#:
+#: The eval suite wants something else. Its examples mutate the store — refunds,
+#: support cases, orders — so running two of them against one file makes each
+#: example's writes visible to the other, and the suite grades correct behaviour
+#: as a failure at random. The previous fix was a per-customer mutex, which worked
+#: but serialized eleven of the thirty-five cases behind one lock. Giving each
+#: example a private copy of the database removes the shared resource instead of
+#: queueing for it, and the suite runs at full concurrency.
+#:
+#: A ContextVar rather than a parameter threaded through forty call sites: the
+#: binding has to reach `policy.adjudicate` and `cart.build_cart` too, and those
+#: are pure functions that should not grow a `db=` argument to serve a test
+#: harness.
+_ACTIVE_DB: ContextVar[Path | None] = ContextVar("chinook_active_db", default=None)
+
+
+def active_db() -> Path:
+    """The database path this context should read and write."""
+    return _ACTIVE_DB.get() or DEMO_DB
+
+
+@contextmanager
+def use_db(path: str | Path | None) -> Iterator[Path]:
+    """Bind this context to `path`. A `None` path is a no-op, so callers that may
+    or may not have a private database can wrap unconditionally.
+
+    ContextVars are per-thread, so a worker in an evaluation thread pool binds
+    only itself. That is exactly the isolation the eval suite needs.
+    """
+    if path is None:
+        yield active_db()
+        return
+    resolved = Path(path)
+    token = _ACTIVE_DB.set(resolved)
+    try:
+        yield resolved
+    finally:
+        _ACTIVE_DB.reset(token)
 
 
 def _row_factory(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
@@ -24,12 +69,12 @@ def _row_factory(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
 
 @contextmanager
 def read_conn() -> Iterator[sqlite3.Connection]:
-    """Open the demo database read-only.
+    """Open the active database read-only.
 
     Uses a URI with `mode=ro` so SQLite itself rejects writes. This is the
     connection every lookup tool uses.
     """
-    conn = sqlite3.connect(f"file:{DEMO_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{active_db()}?mode=ro", uri=True)
     conn.row_factory = _row_factory
     try:
         yield conn
@@ -39,13 +84,13 @@ def read_conn() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def write_conn() -> Iterator[sqlite3.Connection]:
-    """Open the demo database read-write, in a transaction.
+    """Open the active database read-write, in a transaction.
 
     Only three tools ever reach this: `issue_refund`, `checkout_cart`, and
     `file_escalation` — all of which sit behind human approval or write to
     support tables rather than to customer-facing financial records.
     """
-    conn = sqlite3.connect(DEMO_DB)
+    conn = sqlite3.connect(active_db())
     conn.row_factory = _row_factory
     conn.execute("PRAGMA foreign_keys = ON")
     try:

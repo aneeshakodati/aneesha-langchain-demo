@@ -3,5 +3,6 @@
   "graphs": {
     "support": "chinook_support.graph:graph"
   },
-  "env": ".env"
+  "env": ".env",
+  "python_version": "3.13"
 }

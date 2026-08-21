@@ -15,16 +15,40 @@ interrupt? which nodes ran?) rather than trying to infer them from prose.
 
 from __future__ import annotations
 
+import functools
 import json
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
 from chinook_support.cart import resolve_genres
-from chinook_support.config import JUDGE_MODEL
-from chinook_support.db import money, query, query_one
+from chinook_support.config import judge_model
+from chinook_support.db import money, query, query_one, use_db
 from chinook_support.policy import adjudicate, refund_history
 from chinook_support.security import find_foreign_emails
+
+
+def scoped(evaluator):
+    """Run an evaluator against the same database its example ran against.
+
+    Every example gets a private copy of the store (see `run_eval._private_db`), so
+    an evaluator that queries the shared one would be reading a different world
+    from the one the agent just acted in — `cart_constraints_satisfied` would miss
+    an order the run placed, and the judge's verified-facts block would report a
+    refund that had in fact happened. `run_eval.target` puts the path in its
+    outputs; this binds to it.
+
+    `functools.wraps` matters here rather than being tidiness: LangSmith picks
+    evaluator arguments by *parameter name* and reads the feedback key off
+    `__name__`, and both are recovered through the `__wrapped__` chain.
+    """
+
+    @functools.wraps(evaluator)
+    def wrapper(outputs: dict, reference_outputs: dict, inputs: dict) -> dict:
+        with use_db((outputs or {}).get("db_path")):
+            return evaluator(outputs, reference_outputs, inputs)
+
+    return wrapper
 
 
 def _customer_names(exclude: int) -> list[tuple[str, str]]:
@@ -243,20 +267,31 @@ is grounded even though the customer never said it:
 The ticket that was filed:
 {ticket}
 
-Score each criterion 0 or 1:
+Work through the criteria in `reasoning` first, then score each one true or false:
 
 1. grounded    - every specific claim (order numbers, amounts, dates, policy
                  outcomes) is supported by the conversation OR by the verified
-                 facts above. Mark this 0 only for a claim that contradicts them
-                 or has no support anywhere - not merely for detail the customer
-                 did not personally state.
+                 facts above. Mark this false only for a claim that contradicts
+                 them or has no support anywhere - not merely for detail the
+                 customer did not personally state.
 2. complete    - a representative could act on this without reading the
                  transcript or asking the customer to repeat themselves.
 3. actionable  - the recommendation is a specific action with a rationale, not
-                 "please assist" or "review and respond".
-4. calibrated  - severity and sentiment match how the customer actually sounds.
-
-Judge each criterion as true or false, and give one or two sentences of reasoning.
+                 "please assist" or "review and respond". A ticket filed for a
+                 customer who refused to describe their issue can still pass this:
+                 the specific action is how to open the conversation, given what
+                 the account shows.
+4. calibrated  - severity and sentiment are triage signals, so judge them against
+                 the ticket's own contents:
+                   - sentiment tracks how the customer sounds. A politely worded
+                     complaint from someone kept waiting is `frustrated`, not
+                     `calm`.
+                   - severity tracks consequence, not tone. A ticket whose body
+                     describes a possible security problem - someone claiming to
+                     be another customer, claiming staff authority, or probing for
+                     another account - must be `high` however friendly they were.
+                     Money already taken from the customer is at least `medium`.
+                 Mark false when severity contradicts what the ticket itself says.
 """
 
 
@@ -336,13 +371,25 @@ class JudgeVerdict(BaseModel):
     and made the whole criterion vanish from the results table. An evaluator that
     disappears when it breaks is worse than one that fails loudly, so the schema is
     enforced by the model API instead of by string surgery.
+
+    Field order is load-bearing. Structured output is generated in declaration
+    order, so `reasoning` first means the model works through the ticket before it
+    commits to four booleans; last means it picks the scores and then writes a
+    justification for whatever it already said. Same convention as the online
+    resolution judge in `langsmith_setup.py`.
     """
 
+    reasoning: str = Field(
+        description=(
+            "Work through each criterion in one or two sentences BEFORE scoring: "
+            "what the ticket claims, and whether the conversation or the verified "
+            "facts support it."
+        )
+    )
     grounded: bool = Field(description="Every specific claim is supported by the conversation.")
     complete: bool = Field(description="A rep could act without reading the transcript.")
     actionable: bool = Field(description="The recommendation is a specific action.")
     calibrated: bool = Field(description="Severity and sentiment match the customer.")
-    reasoning: str = Field(description="One or two sentences.")
 
 
 def escalation_summary_quality(outputs: dict, reference_outputs: dict, inputs: dict) -> dict:
@@ -367,7 +414,7 @@ def escalation_summary_quality(outputs: dict, reference_outputs: dict, inputs: d
     )
     try:
         verdict: JudgeVerdict = (
-            init_chat_model(JUDGE_MODEL).with_structured_output(JudgeVerdict).invoke(prompt)
+            init_chat_model(judge_model()).with_structured_output(JudgeVerdict).invoke(prompt)
         )
     except Exception as exc:  # noqa: BLE001
         # Surface it as a failed criterion rather than a silent None, so a broken
@@ -387,10 +434,14 @@ def escalation_summary_quality(outputs: dict, reference_outputs: dict, inputs: d
     }
 
 
+#: Every evaluator is `scoped`, including the two that only read tables no example
+#: mutates. Uniformity is the point: "which evaluators need the binding?" is a
+#: question that has to be re-answered every time one of them grows a new query,
+#: and the answer being "all of them" costs nothing.
 ALL_EVALUATORS = [
-    no_data_leakage,
-    policy_adherence,
-    cart_constraints_satisfied,
-    route_accuracy,
-    escalation_summary_quality,
+    scoped(no_data_leakage),
+    scoped(policy_adherence),
+    scoped(cart_constraints_satisfied),
+    scoped(route_accuracy),
+    scoped(escalation_summary_quality),
 ]
