@@ -121,6 +121,21 @@ _AREA_OF_AGENT = {
 }
 
 
+def text_of(message: AnyMessage) -> str:
+    """The human-readable text of a message, and nothing else.
+
+    Anthropic returns *content blocks* — a list — whenever extended thinking is on,
+    so `message.content` is `[{"type": "thinking", "signature": "EocQ...base64..."},
+    {"type": "text", "text": "..."}]`. Anything that did `str(message.content)`
+    therefore got a stringified list with an encrypted thinking blob in it. That
+    reached three places that matter: the router's transcript (so the cheap model
+    read base64 instead of the conversation), the "has a specialist already
+    answered?" check, and the reply the eval suite graded. `.text` concatenates the
+    text blocks and drops the rest, which is what every one of those wanted.
+    """
+    return (message.text or "").strip()
+
+
 def _last_specialist_area(messages: list[AnyMessage]) -> str | None:
     """Which specialist produced the final answer, if the customer hasn't replied.
 
@@ -130,7 +145,7 @@ def _last_specialist_area(messages: list[AnyMessage]) -> str | None:
     for message in reversed(messages):
         if isinstance(message, HumanMessage) and not is_handoff(message):
             return None
-        if isinstance(message, AIMessage) and message.content and not message.tool_calls:
+        if isinstance(message, AIMessage) and text_of(message) and not message.tool_calls:
             return _AREA_OF_AGENT.get(getattr(message, "name", "") or "")
     return None
 
@@ -157,8 +172,8 @@ def _transcript(messages: list[AnyMessage], limit: int = 8) -> str:
         role = getattr(message, "type", "?")
         if role == "tool":
             continue
-        text = message.content if isinstance(message.content, str) else str(message.content)
-        if not text.strip():
+        text = text_of(message)
+        if not text:
             # An assistant turn that was purely tool calls.
             calls = getattr(message, "tool_calls", None)
             if calls:
@@ -259,8 +274,11 @@ def respond(state: SupportState, runtime: Runtime[SupportContext]) -> dict:
     """
     messages = state["messages"]
     last = messages[-1] if messages else None
+    # `text_of`, not `.content`: a message carrying only a thinking block is not an
+    # answer, and treating it as one is exactly the silent turn this node exists to
+    # prevent.
     already_answered = (
-        isinstance(last, AIMessage) and bool(last.content) and not last.tool_calls
+        isinstance(last, AIMessage) and bool(text_of(last)) and not last.tool_calls
     )
     if already_answered:
         return {}
@@ -283,7 +301,7 @@ def respond(state: SupportState, runtime: Runtime[SupportContext]) -> dict:
             *visible_messages(messages)[-4:],
         ]
     )
-    return {"messages": [AIMessage(content=reply.content)]}
+    return {"messages": [AIMessage(content=text_of(reply))]}
 
 
 def route_from_supervisor(

@@ -127,6 +127,15 @@ Rules:
   `finish`. Do not route again just to add commentary.
 - If a specialist explicitly said it cannot resolve the issue and a representative
   should review it, choose `escalation`.
+- Facts before handoff. If the customer names an order or asks about money, route
+  to `billing` FIRST even when they are furious or have asked for a human. Anger is
+  a reason to escalate *quickly*, not a reason to escalate *blind*: escalating
+  first produces a ticket that says "please look up order #416", which makes the
+  representative redo the work and the customer repeat themselves. Let billing
+  establish the amount, the age and the policy verdict, then escalate — the
+  specialists share the conversation, so escalation inherits all of it.
+  Route straight to `escalation` only when there is nothing to look up, e.g. "put
+  me through to a person".
 - Never choose the same specialist that just spoke unless the customer has since
   said something new.
 

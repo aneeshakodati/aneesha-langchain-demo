@@ -390,7 +390,9 @@ def upload(examples: list[dict]) -> None:
         metadata=[e["metadata"] for e in examples],
     )
     print(f"  uploaded {len(examples)} examples")
-    print(f"  {client.web_url}/datasets/{dataset.id}")
+    # `Client.web_url` doesn't exist on langsmith>=0.11; the UI host is `_host_url`.
+    host = getattr(client, "_host_url", None) or "https://smith.langchain.com"
+    print(f"  {host}/datasets/{dataset.id}")
 
 
 def main() -> None:

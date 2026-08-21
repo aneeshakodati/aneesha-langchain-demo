@@ -18,7 +18,7 @@ from typing import Literal
 from langchain.agents import create_agent
 from pydantic import BaseModel, Field
 
-from .config import AGENT_MODEL
+from .config import agent_model
 from .context import SupportContext
 from .middleware import (
     billing_middleware,
@@ -57,7 +57,7 @@ class RouteDecision(BaseModel):
 def build_billing_agent():
     """Orders, charges, refund adjudication."""
     return create_agent(
-        model=AGENT_MODEL,
+        model=agent_model(),
         tools=BILLING_TOOLS,
         middleware=billing_middleware(),
         context_schema=SupportContext,
@@ -68,7 +68,7 @@ def build_billing_agent():
 def build_merch_agent():
     """Catalog search and constraint-based cart building."""
     return create_agent(
-        model=AGENT_MODEL,
+        model=agent_model(),
         tools=MERCH_TOOLS,
         middleware=merch_middleware(),
         context_schema=SupportContext,
@@ -87,7 +87,7 @@ def build_escalation_agent():
     parent graph needs to return.
     """
     return create_agent(
-        model=AGENT_MODEL,
+        model=agent_model(),
         tools=ESCALATION_TOOLS,
         middleware=escalation_middleware(),
         context_schema=SupportContext,

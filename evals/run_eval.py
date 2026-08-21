@@ -17,9 +17,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+import threading
 import uuid
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
+
+# Running this as a script puts evals/ on sys.path, not the repo root, so
+# `from evals.dataset import ...` would fail. Add the root explicitly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -27,7 +34,7 @@ from langgraph.store.memory import InMemoryStore
 import chinook_support  # noqa: F401  (loads .env)
 from chinook_support.context import SupportContext
 from chinook_support.db import query, query_one, write_conn
-from chinook_support.graph import build_graph
+from chinook_support.graph import build_graph, text_of
 
 from evals.dataset import DATASET_NAME, build_examples
 from evals.evaluators import ALL_EVALUATORS
@@ -50,6 +57,23 @@ def _reset_account(customer_id: int) -> None:
         conn.execute("DELETE FROM SupportCase WHERE CustomerId = ?", (customer_id,))
 
 
+#: One lock per customer, held for the whole of `target`.
+#:
+#: The reset above plus the side-effect reads at the end are a read-modify-write
+#: over rows keyed by customer, and LangSmith runs examples on a thread pool. Two
+#: concurrent examples for customer 1 — and eleven of the cases are customer 1 —
+#: would have one wipe the other's refund row mid-run, so a correct agent gets
+#: graded as a failure at random. Locking per customer keeps that serialized while
+#: still running different customers in parallel.
+_ACCOUNT_LOCKS: defaultdict[int, threading.Lock] = defaultdict(threading.Lock)
+_LOCKS_GUARD = threading.Lock()
+
+
+def _account_lock(customer_id: int) -> threading.Lock:
+    with _LOCKS_GUARD:
+        return _ACCOUNT_LOCKS[customer_id]
+
+
 def target(inputs: dict) -> dict:
     """Run one conversation and report what observably happened.
 
@@ -57,12 +81,13 @@ def target(inputs: dict) -> dict:
     measure how the agent *describes* what it did; these let them grade what it
     actually did.
     """
+    with _account_lock(inputs["customer_id"]):
+        return _run_one(inputs)
+
+
+def _run_one(inputs: dict) -> dict:
     customer_id = inputs["customer_id"]
     _reset_account(customer_id)
-
-    model = os.environ.get("EVAL_MODEL")
-    if model:
-        os.environ["AGENT_MODEL"] = model
 
     store = InMemoryStore()  # fresh cart per example
     graph = build_graph(checkpointer=InMemorySaver(), store=store)
@@ -95,12 +120,11 @@ def target(inputs: dict) -> dict:
     messages = state.get("messages", [])
     reply = ""
     for message in reversed(messages):
-        if getattr(message, "type", None) == "ai" and message.content:
-            reply = (
-                message.content
-                if isinstance(message.content, str)
-                else str(message.content)
-            )
+        # `text_of`, not `str(message.content)`: with extended thinking on, content
+        # is a block list and stringifying it graded the encrypted thinking blob as
+        # if it were the customer-facing reply.
+        if getattr(message, "type", None) == "ai" and text_of(message):
+            reply = text_of(message)
             break
 
     # Observable side effects.
@@ -123,8 +147,18 @@ def target(inputs: dict) -> dict:
     if case:
         writes.append({"kind": "support_case", "customer_id": case["CustomerId"]})
 
+    # Which tools actually ran. The judge needs this: a ticket that says "I ran the
+    # refund eligibility check" is a true statement about work the transcript never
+    # shows, and without the tool list the judge scores it as invented.
+    tools_used: list[str] = []
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            if call["name"] not in tools_used:
+                tools_used.append(call["name"])
+
     return {
         "reply": reply,
+        "tools_used": tools_used,
         "route_trail": route_trail,
         "interrupted": interrupted,
         "refund_created": refund is not None,
@@ -183,7 +217,7 @@ def run_local(examples: list[dict]) -> int:
     return 1 if failures else 0
 
 
-def run_langsmith(examples: list[dict], suffix: str) -> int:
+def run_langsmith(kind: str | None, limit: int | None, suffix: str) -> int:
     from langsmith import Client
 
     client = Client()
@@ -191,20 +225,41 @@ def run_langsmith(examples: list[dict], suffix: str) -> int:
         print(f"Dataset {DATASET_NAME!r} not found. Run: python evals/dataset.py")
         return 1
 
+    # `--kind` / `--limit` have to be applied to the *uploaded* examples, not to
+    # the locally built list: `evaluate(data=DATASET_NAME)` fetches the whole
+    # dataset and ignores anything filtered here, so a `--limit 2` smoke run used
+    # to quietly bill for all 35 cases.
+    data: Any = DATASET_NAME
+    if kind or limit:
+        dataset = client.read_dataset(dataset_name=DATASET_NAME)
+        selected = [
+            example
+            for example in client.list_examples(dataset_id=dataset.id)
+            if not kind or (example.metadata or {}).get("kind") == kind
+        ]
+        selected.sort(key=lambda example: (example.metadata or {}).get("name", ""))
+        data = selected[:limit] if limit else selected
+        if not data:
+            print("No uploaded examples matched. Re-run: python evals/dataset.py")
+            return 1
+
+    count = len(data) if isinstance(data, list) else None
     results = client.evaluate(
         target,
-        data=DATASET_NAME,
+        data=data,
         evaluators=ALL_EVALUATORS,
         experiment_prefix=suffix,
         max_concurrency=4,
         metadata={
-            "agent_model": os.environ.get("EVAL_MODEL", os.environ.get("AGENT_MODEL", "default")),
-            "example_count": len(examples),
+            "agent_model": os.environ.get("AGENT_MODEL", "default"),
+            "example_count": count,
         },
     )
     print(f"\n{BOLD}Experiment complete.{RESET} Open it in LangSmith to compare runs.")
+    host = getattr(client, "_host_url", None) or "https://smith.langchain.com"
     try:
-        print(results.experiment_name)
+        print(f"  {results.experiment_name}")
+        print(f"  {host}/datasets/{client.read_dataset(dataset_name=DATASET_NAME).id}/compare")
     except Exception:  # noqa: BLE001
         pass
     return 0
@@ -219,7 +274,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.model:
-        os.environ["EVAL_MODEL"] = args.model
+        # Read by `config.agent_model()` when each specialist is constructed, which
+        # happens inside `build_graph()` per example — so setting it here is enough.
+        os.environ["AGENT_MODEL"] = args.model
 
     examples = build_examples()
     if args.kind:
@@ -230,7 +287,7 @@ def main() -> int:
         print("No examples matched.")
         return 1
 
-    print(f"{BOLD}{len(examples)} examples{RESET} | model={os.environ.get('EVAL_MODEL', 'default')}")
+    print(f"{BOLD}{len(examples)} examples{RESET} | model={os.environ.get('AGENT_MODEL', 'default')}")
 
     if args.local or not os.getenv("LANGSMITH_API_KEY"):
         if not args.local:
@@ -238,7 +295,7 @@ def main() -> int:
         return run_local(examples)
 
     suffix = args.kind or "full"
-    return run_langsmith(examples, f"chinook-{suffix}")
+    return run_langsmith(args.kind, args.limit, f"chinook-{suffix}")
 
 
 if __name__ == "__main__":

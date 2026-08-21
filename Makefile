@@ -1,4 +1,4 @@
-.PHONY: setup db reset studio demo test eval eval-local dataset clean
+.PHONY: setup db reset studio demo test eval eval-local eval-haiku dataset monitoring clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
@@ -35,6 +35,12 @@ eval:  ## run the eval suite as a LangSmith experiment
 
 eval-local:  ## run the same evaluators without LangSmith
 	$(PY) evals/run_eval.py --local
+
+eval-haiku:  ## same suite on the cheap model, for the comparison view
+	$(PY) evals/run_eval.py --model anthropic:claude-haiku-4-5-20251001
+
+monitoring:  ## create the annotation queue and online evaluators (idempotent)
+	$(PY) evals/langsmith_setup.py
 
 clean:
 	rm -rf .langgraph_api **/__pycache__ .pytest_cache *.egg-info

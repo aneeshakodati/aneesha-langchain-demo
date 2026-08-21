@@ -32,6 +32,18 @@ STORE_DB = DATA_DIR / "store.sqlite"
 
 #: Specialist agents. Reasoning quality matters most here.
 AGENT_MODEL = os.getenv("AGENT_MODEL", "anthropic:claude-sonnet-5")
+
+
+def agent_model() -> str:
+    """The specialist model, resolved at agent-construction time.
+
+    Read through a function rather than off the module constant so that
+    `run_eval.py --model ...` works: the constant is frozen at import, and by the
+    time the flag is parsed `agents.py` has long since imported it. That silently
+    made the Sonnet-vs-Haiku comparison — the whole point of the flag — run both
+    experiments on the same model.
+    """
+    return os.getenv("AGENT_MODEL", AGENT_MODEL)
 #: Supervisor router. One structured-output call per hop, so latency/cost dominate.
 ROUTER_MODEL = os.getenv("ROUTER_MODEL", "anthropic:claude-haiku-4-5-20251001")
 #: Conversation summarization once the merch browse session gets long.
