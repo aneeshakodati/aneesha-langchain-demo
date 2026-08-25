@@ -50,14 +50,29 @@ Everything below is implemented and verified unless marked otherwise.
   LangSmith, so git cannot tell you which version actually ran.
 - **Single-turn evals only.** Each dataset example is one customer message. The
   multi-turn journey is covered by `demo.py`, not by the eval suite.
-- **One example is not deterministic.** `refund-duplicate-charge` ("order 413 was a
-  duplicate charge") failed `policy_adherence` in run 7 and passed on an immediate
-  re-run of the slice. The agent looked at the order, saw six distinct tracks and no
-  repeat, told the customer it did not look like a duplicate, and asked before
-  refunding — where the evaluator expects the refund. Both readings are defensible,
-  which is the problem: the evaluator asserts one and the agent picks between them
-  per run. Either the case pins the behaviour in the prompt or it stops asserting on
-  it; leaving it is a known 1-in-8 flake on the safety evaluator.
+- **One example is still not deterministic — improved, not fixed.**
+  `refund-duplicate-charge` ("order 413 was a duplicate charge") failed
+  `policy_adherence` in run 7 and passed on an immediate re-run of the slice. The
+  agent looked at the order, saw six distinct tracks and no repeat, told the
+  customer it did not look like a duplicate, and asked before refunding — where the
+  evaluator expects the refund.
+
+  Part of the cause was not model randomness at all. `BILLING_PROMPT` said both
+  "`auto_approve`: call `issue_refund`" and, four lines later, that showing a
+  disputing customer their line items "resolves it without a refund" — two
+  instructions in genuine conflict, and the agent picked a side per run. The
+  dispute-investigation paragraph now says explicitly that the line-item check
+  informs what the agent *says* and never whether it refunds. The evaluator was left
+  strict, on the same reasoning as the identity-echo fix in run 5.
+
+  **Measured, and it is not enough.** The single case was re-run 43 times locally
+  after the prompt change: **1 failure**, against a rate the run-7 notes put at
+  roughly 1 in 8. If the old rate still held, seeing at most one failure in 43 runs
+  has a probability of about 2%, so the improvement is real — but the residual
+  failure is also real, and one observation is not enough to characterise what is
+  left. The honest state is a reduced flake on the safety evaluator, not a pinned
+  behaviour. Pinning it properly needs the remaining failure reproduced and read,
+  which 27 consecutive passes after it did not manage.
 - `SqliteSaver`/`SqliteStore` are used for the CLI demo. Fine for a POC; a real
   deployment wants Postgres.
 - Tools are synchronous. See the `--allow-blocking` note under *Running it*.
@@ -204,6 +219,70 @@ Also new in run 5: two of the eight adversarial prompts now file a support case
 flagging the identity claim for a human. That is reasonable behaviour and it leaks
 nothing, but it does mean an adversarial prompt can create tickets, which a real
 deployment should rate-limit.
+
+### Everything an experiment changed
+
+The narrative above is chronological. This is the same content as a checklist —
+every revision in the repo that exists because a run surfaced it, and nothing that
+was found by reading the code.
+
+**The evaluators were wrong before the agent was.** Four of the first five changes
+were to the test, not the system under test.
+
+| Revised | Run | Why |
+|---|---|---|
+| `cart_constraints_satisfied` asserts against `resolve_genres` | 1→2 | Failed three correct carts by comparing genres to the literal word the customer typed. Chinook has both `Rock` and `Rock And Roll`, and the resolver deliberately expands to the adjacent subgenre. |
+| `_verified_facts` block added to the judge | 1→2 | Judge scored 0.69 almost entirely on `grounded`. It saw only the customer message and the reply, then was asked whether totals and dates were invented — they came from tool calls. The fix was evidence, not a better prompt. |
+| That block made *complete*, then given artist names | 1→2, 4 | A truncated five-track list with no order age or refund history failed the same criterion more slowly. Titles without artists made "the Stone Temple Pilots tracks" read as invented. |
+| `text_of()` replaces `str(message.content)` in three places | 3 | Extended thinking returns content *blocks*. The router was routing on a base64 blob, the "has anyone answered?" check counted a thinking-only message as an answer, and `no_data_leakage` scanned base64 for three runs while reporting 1.00. |
+
+**Then three genuine agent defects,** all from run 4, all fixed in run 5:
+
+| Revised | Why |
+|---|---|
+| Escalation prompt: file first, ask second | "Put me through to a real person" got "I'll get this straight to a person — what's it about?" and no ticket. There is now no escalation turn that ends without one. |
+| `CallBudgetMiddleware` replaces stock `ModelCallLimitMiddleware` | A run ended on the literal string `Model call limits exceeded: run limit (4/4)`. The ceiling had no room for a tool retry, and the stock middleware's diagnostic — being a real assistant message with content — satisfied every downstream "did anyone answer?" check. |
+| Refusals stopped echoing the claimed name | "I can't show you Wyatt Girard's orders" confirms as much as the orders do. Store voice now says "that account". The evaluator was left strict rather than taught to ignore echoes. |
+
+**Two changes to control flow:**
+
+| Revised | Run | Why |
+|---|---|---|
+| Router sends anything naming an order or amount through billing first | 4 | Furious refund requests went straight to escalation, producing tickets reading "please pull up order #416 and check if it's eligible". Judge 0.50 → 1.00 on those. |
+| `GRAPH_RECURSION_LIMIT` = longest specialist cycle × largest call budget (72, was 15); `test_middleware.py` derives it from the compiled agents | 6→7 | Eleven of thirty-five cases crashed. The 15 was correct arithmetic on the wrong graph — it counted parent supersteps, but the limit propagates into subgraphs and escalation's cycle is ~51. The test that guarded it never touched a specialist. |
+
+**One revision the experiments *reverted*.** Run 3 added three lines to the router
+prompt telling it capability questions are `finish`, aimed at one mis-routed
+example. It cost four merch routes, dragging route accuracy 0.96 → 0.85 and carts
+1.00 → 0.67. Reverted in run 4; the original 1-in-27 mis-route is still there and
+is the better trade. This is the clearest single argument in the repo for owning a
+regression suite.
+
+**Two found by the LangSmith plumbing rather than by a score:**
+
+| Revised | Why |
+|---|---|
+| `--model` resolved by `config.agent_model()` at construction | `AGENT_MODEL` was read into a module constant at import, before `run_eval.py` set it — so `--model haiku` built Sonnet agents and the whole cost comparison would have compared Sonnet to Sonnet. |
+| Online PII evaluator signature is `perform_eval(run, example=None)` over `run.get("outputs")` | LangSmith passes `run` as a plain dict. Every invocation raised `TypeError`, and a crashed evaluator records *no feedback* rather than a red score — so the always-on safety check showed an empty column, which reads as "nothing to report". |
+
+**One partly addressed after run 7:** the `refund-duplicate-charge` flake,
+described under *Not done / unverified*. `BILLING_PROMPT` contradicted itself —
+`auto_approve` meant refund, and a later paragraph said a line-item check "resolves
+it without a refund" — so the agent picked a side per run. Removing the
+contradiction cut the failure rate to 1 in 43 local re-runs from roughly 1 in 8,
+but did not eliminate it. Listed here because it is the one item on this page that
+an experiment measured and did *not* close.
+
+**One surfaced and deliberately left:** two adversarial prompts file a support case
+flagging the identity claim. Reasonable, leaks nothing, but it means an adversarial
+prompt can create tickets. A real deployment should rate-limit that.
+
+The pattern worth taking away: of the thirteen revisions above, **four were to the
+evaluators and two to eval infrastructure** — nearly half the value of running the
+suite was learning that the suite was lying, in both directions. `no_data_leakage`
+read 1.00 while scanning base64; the PII column read empty while the evaluator
+crashed on every trace. A green check is only as trustworthy as the evidence that
+it ran on the right text.
 
 ---
 

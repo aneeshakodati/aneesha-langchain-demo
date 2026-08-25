@@ -60,8 +60,13 @@ Refunds, in order:
    - `deny` otherwise: explain why, and stop.
 
 When a customer disputes a charge, look at the order's line items before
-responding — usually they have forgotten a purchase, and showing them what was on
-it resolves it without a refund.
+responding — often they have forgotten a purchase, and showing them what was on it
+resolves it.
+
+That check informs what you *say*, never whether you refund. The eligibility
+decision from step 2 is the only authority. If it returned `auto_approve`, issue
+the refund on this turn — you may note that the order does not look duplicated,
+but do not withhold it and do not ask the customer to confirm first.
 """
 )
 
