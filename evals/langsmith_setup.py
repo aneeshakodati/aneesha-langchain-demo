@@ -85,6 +85,11 @@ ESCALATION_RULE = "escalations -> human review"
 PII_RULE = "online: pii in reply"
 RESOLUTION_RULE = "online: resolution quality"
 
+#: The root run name of an actual conversation, as LangSmith records it — the
+#: compiled graph's name. Rules filter on this to tell a customer turn apart from
+#: an evaluator that happens to also be a root run in the same project.
+GRAPH_RUN_NAME = "chinook_support"
+
 PII_EVALUATOR = "chinook-pii-in-reply"
 RESOLUTION_EVALUATOR = "chinook-resolution-quality"
 RESOLUTION_PROMPT_HANDLE = "chinook-resolution-quality"
@@ -507,6 +512,14 @@ def setup() -> int:
     # `tree_filter` matches on any run in the trace, which is how "this
     # conversation filed a ticket" is expressed: the root run's own output says
     # nothing about it, but a `file_escalation` tool span in the tree does.
+    #
+    # The name check is not redundant with `is_root`. The eval suite's evaluators
+    # run in-process and are themselves traced into this project as root runs, so
+    # `eq(is_root, true)` alone swept every `policy_adherence`, `route_accuracy`
+    # and `execute_custom_evaluator` invocation into the queue — 461 items, of
+    # which 11 were conversations. A review queue a human cannot face is the same
+    # as no review queue, and it fails quietly: the rule looks healthy and the
+    # supervisor just stops opening it.
     _upsert_rule(
         client,
         {
@@ -514,7 +527,7 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 1.0,
-            "filter": "eq(is_root, true)",
+            "filter": f'and(eq(is_root, true), eq(name, "{GRAPH_RUN_NAME}"))',
             "tree_filter": 'eq(name, "file_escalation")',
             "add_to_annotation_queue_id": str(queue.id),
         },
@@ -538,7 +551,10 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 1.0,  # deterministic and free; no reason to sample
-            "filter": "eq(is_root, true)",
+            # Conversations only — see the note on ESCALATION_RULE. Scoring the
+            # eval suite's own evaluator runs would put their feedback alongside
+            # real traffic in the monitoring charts.
+            "filter": f'and(eq(is_root, true), eq(name, "{GRAPH_RUN_NAME}"))',
             "evaluator_id": pii_id,
         },
     )
@@ -549,7 +565,9 @@ def setup() -> int:
             "session_id": project_id,
             "is_enabled": True,
             "sampling_rate": 0.2,  # a model call per trace; sample it
-            "filter": "eq(is_root, true)",
+            # Conversations only. This one bills a model call per match, so an
+            # over-broad filter costs money as well as clarity.
+            "filter": f'and(eq(is_root, true), eq(name, "{GRAPH_RUN_NAME}"))',
             "evaluator_id": resolution_id,
         },
     )
