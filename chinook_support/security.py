@@ -24,13 +24,14 @@ import functools
 import json
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 
 from .context import coerce_context
-from .db import query
+from .db import active_db, query
 
 #: Argument names that would let the model choose whose data to read. No tool in
 #: this package accepts any of them; a call containing one is either a bug or an
@@ -48,17 +49,33 @@ FORBIDDEN_ARGS = {
 }
 
 
-@functools.lru_cache(maxsize=1)
-def _email_owners() -> dict[str, int]:
-    """Every customer email in the store, lowercased -> CustomerId.
+@functools.lru_cache(maxsize=16)
+def _email_owners_for(db: Path) -> dict[str, int]:
+    """Every customer email in `db`, lowercased -> CustomerId.
 
-    Cached for the process lifetime; the customer table doesn't change under us
-    during a demo, and re-querying on every tool call would be wasteful.
+    Keyed on the database path, which is not decoration. `query` reads whatever
+    `use_db` has bound to this context, but an unkeyed cache is populated once per
+    *process* — so the first database touched would supply the email set used to
+    check every later one. The eval harness gives each example a private copy, and
+    a fixture with a different customer table would have been checked against the
+    wrong emails entirely.
+
+    It fails open, which is the part that matters: an address the cache has never
+    seen is not a known customer's, so `find_foreign_emails` returns nothing and
+    the leak passes. A tenant-isolation tripwire whose answer depends on which
+    database happened to be open first is not a control.
+
+    Still cached, just correctly: the customer table doesn't change under us during
+    a run, and re-querying on every tool call would be wasteful.
     """
     return {
         r["Email"].lower(): r["CustomerId"]
         for r in query("SELECT CustomerId, Email FROM Customer WHERE Email IS NOT NULL")
     }
+
+
+def _email_owners() -> dict[str, int]:
+    return _email_owners_for(active_db())
 
 
 def find_foreign_emails(text: str, caller_id: int) -> list[str]:

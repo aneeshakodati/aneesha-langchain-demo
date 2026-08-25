@@ -99,6 +99,42 @@ def test_no_tool_output_contains_another_customers_email():
             assert not find_foreign_emails(payload, customer_id)
 
 
+def test_the_email_map_follows_the_active_database(tmp_path):
+    """The leakage check must read the database the run is actually bound to.
+
+    `_email_owners` was cached per process rather than per database, so whichever
+    file was opened first supplied the email set for every later one. It failed
+    *open*: an address the stale map had never seen was not a known customer's, so
+    nothing was reported. The eval harness gives every example a private copy, and
+    this is the one control where being right about the wrong database is silent.
+    """
+    import shutil
+    import sqlite3
+
+    from chinook_support.config import DEMO_DB
+    from chinook_support.db import use_db
+
+    other = tmp_path / "other.db"
+    shutil.copyfile(DEMO_DB, other)
+    connection = sqlite3.connect(other)
+    connection.execute(
+        "UPDATE Customer SET Email = ? WHERE CustomerId = ?", ("elsewhere@example.com", BOB)
+    )
+    connection.commit()
+    connection.close()
+
+    # Populate the cache from the default database first — that is the ordering
+    # that produced the bug.
+    _email_owners()
+
+    with use_db(other):
+        assert find_foreign_emails("contact them at elsewhere@example.com", ALICE) == [
+            "elsewhere@example.com"
+        ]
+        # And the caller's own address is still not a leak.
+        assert not find_foreign_emails("contact them at elsewhere@example.com", BOB)
+
+
 # --- The middleware backstop --------------------------------------------------
 
 
